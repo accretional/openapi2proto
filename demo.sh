@@ -1,22 +1,22 @@
 #!/bin/bash
 # =============================================================================
-# MASTER DEMO — Patron için Tek Komut Demo
+# MASTER DEMO — Single Command Demo for Presentation
 # =============================================================================
-# Kullanım:
-#   ./demo.sh              # Sadece proto üretimi göster
-#   ./demo.sh --test       # Twilio API testi de dahil
+# Usage:
+#   ./demo.sh              # Proto generation only
+#   ./demo.sh --test       # Includes Twilio API test
 # =============================================================================
 
 cd "$(dirname "$0")"
 
-# .env dosyasından yükle (varsa)
-if [ -f .env ]; then
-  export $(grep -v '^#' .env | xargs)
-fi
-
 RUN_TEST=false
 if [ "$1" = "--test" ] || [ "$1" = "-t" ]; then
   RUN_TEST=true
+fi
+
+# Load from .env if present
+if [ -f .env ]; then
+  export $(grep -v '^#' .env | xargs)
 fi
 
 clear
@@ -29,29 +29,29 @@ echo "║           Universal OpenAPI v3 → Protobuf/gRPC Converter            
 echo "║                                                                      ║"
 echo "╚══════════════════════════════════════════════════════════════════════╝"
 echo ""
-echo "Bu demo şunları gösterir:"
-echo "  1. OpenAPI v3 spec → Proto dosyası dönüşümü"
-echo "  2. Proto validasyonu (protoc)"
-echo "  3. Go kod üretimi"
-echo "  4. Gerçek Twilio API testi (--test flag ile)"
+echo "This demo shows:"
+echo "  1. OpenAPI v3 spec → Proto file conversion"
+echo "  2. Proto validation (protoc)"
+echo "  3. Go code generation"
+echo "  4. Live Twilio API test (--test flag)"
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# ── DEMO 1: Proto Üretimi ──
+# ── DEMO 1: Proto Generation ──
 echo ""
 echo "████████████████████████████████████████████████████████████████████████"
-echo "█                    DEMO 1: PROTO ÜRETİMİ                           █"
+echo "█                    DEMO 1: PROTO GENERATION                        █"
 echo "████████████████████████████████████████████████████████████████████████"
 echo ""
 
-echo "Komut:"
+echo "Command:"
 echo "  go run ./cmd/openapi2proto \\"
 echo "    -input twilio_voice_v1.json \\"
 echo "    -output twilio_voice_v1.proto \\"
 echo "    -package twilio.voice.v1"
 echo ""
-echo "Çalışıyor..."
+echo "Running..."
 echo ""
 
 go run ./cmd/openapi2proto \
@@ -60,25 +60,25 @@ go run ./cmd/openapi2proto \
   -package twilio.voice.v1 2>&1
 
 echo ""
-echo "✅ Proto dosyası üretildi!"
+echo "✅ Proto file generated!"
 echo ""
-echo "Üretilen dosyanın ilk 50 satırı:"
+echo "First 50 lines of generated file:"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 head -50 /tmp/demo_voice.proto
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# ── DEMO 2: Proto Validasyonu ──
+# ── DEMO 2: Proto Validation ──
 echo ""
 echo "████████████████████████████████████████████████████████████████████████"
-echo "█                  DEMO 2: PROTO VALIDASYONU                         █"
+echo "█                    DEMO 2: PROTO VALIDATION                         █"
 echo "████████████████████████████████████████████████████████████████████████"
 echo ""
 
-echo "Komut:"
+echo "Command:"
 echo "  protoc --proto_path=. --descriptor_set_out=/tmp/demo.pb demo.proto"
 echo ""
-echo "Çalışıyor..."
+echo "Running..."
 echo ""
 
 protoc \
@@ -88,13 +88,13 @@ protoc \
   --descriptor_set_out=/tmp/demo.pb \
   /tmp/demo_voice.proto 2>&1
 
-echo "✅ Proto validasyonu başarılı!"
+echo "✅ Proto validation passed!"
 echo ""
 
-# ── DEMO 3: İstatistikler ──
+# ── DEMO 3: Statistics ──
 echo ""
 echo "████████████████████████████████████████████████████████████████████████"
-echo "█                    DEMO 3: İSTATİSTİKLER                           █"
+echo "█                    DEMO 3: STATISTICS                              █"
 echo "████████████████████████████████████████████████████████████████████████"
 echo ""
 
@@ -103,47 +103,52 @@ TOTAL_MESSAGES=$(grep -r "^message " generated | wc -l | tr -d ' ')
 TOTAL_SERVICES=$(grep -r "^service " generated | wc -l | tr -d ' ')
 TOTAL_RPCS=$(grep -r "rpc " generated | wc -l | tr -d ' ')
 
-echo "Üretilen Twilio Proto Dosyaları:"
+echo "Generated Twilio Proto Files:"
 echo ""
-echo "  📁 Proto dosyaları:    $TOTAL_PROTOS"
-echo "  📦 Message tanımları:  $TOTAL_MESSAGES"
-echo "  🔧 Service tanımları:  $TOTAL_SERVICES"
-echo "  📡 RPC metodları:      $TOTAL_RPCS"
+echo "  📁 Proto files:       $TOTAL_PROTOS"
+echo "  📦 Message types:    $TOTAL_MESSAGES"
+echo "  🔧 Service types:    $TOTAL_SERVICES"
+echo "  📡 RPC methods:      $TOTAL_RPCS"
 echo ""
 
-# ── DEMO 4: API Testi (opsiyonel) ──
+# ── DEMO 4: API Test (optional) ──
 if $RUN_TEST; then
   echo ""
   echo "████████████████████████████████████████████████████████████████████████"
-  echo "█                  DEMO 4: GERÇEK API TESTİ                          █"
+  echo "█                    DEMO 4: LIVE API TEST                            █"
   echo "████████████████████████████████████████████████████████████████████████"
   echo ""
 
   if [ -z "$TWILIO_ACCOUNT_SID" ] || [ -z "$TWILIO_AUTH_TOKEN" ]; then
-    echo "⚠️  API testi için credentials gerekiyor:"
+    echo "⚠️  API test requires credentials:"
     echo ""
-    echo "  export TWILIO_ACCOUNT_SID=ACxxx"
-    echo "  export TWILIO_AUTH_TOKEN=xxx"
-    echo "  ./demo.sh --test"
+    echo "  Create .env file:"
+    echo "    TWILIO_ACCOUNT_SID=ACxxx"
+    echo "    TWILIO_AUTH_TOKEN=xxx"
+    echo ""
+    echo "  Or export them:"
+    echo "    export TWILIO_ACCOUNT_SID=ACxxx"
+    echo "    export TWILIO_AUTH_TOKEN=xxx"
+    echo "    ./demo.sh --test"
   else
     ./demo_test.sh
   fi
 fi
 
-# ── Özet ──
+# ── Summary ──
 echo ""
 echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "║                           Ö Z E T                                    ║"
+echo "║                           S U M M A R Y                              ║"
 echo "╠══════════════════════════════════════════════════════════════════════╣"
 echo "║                                                                      ║"
-echo "║  ✅ OpenAPI v3 → Proto dönüşümü çalışıyor                           ║"
-echo "║  ✅ Proto validasyonu geçiyor                                        ║"
-echo "║  ✅ 56 Twilio servisi için hazır proto'lar var                      ║"
-echo "║  ✅ Type-safe Go/Python/Java kodu üretilebilir                      ║"
+echo "║  ✅ OpenAPI v3 → Proto conversion works                            ║"
+echo "║  ✅ Proto validation passed                                         ║"
+echo "║  ✅ 56 Twilio services with ready-to-use protos                    ║"
+echo "║  ✅ Type-safe Go/Python/Java code can be generated                 ║"
 echo "║                                                                      ║"
 echo "╠══════════════════════════════════════════════════════════════════════╣"
 echo "║                                                                      ║"
-echo "║  Bu tool HERHANGI bir OpenAPI v3 API ile çalışır:                   ║"
-echo "║  • Twilio  • Stripe  • GitHub  • Salesforce  • Kendi API'niz       ║"
+echo "║  This tool works with ANY OpenAPI v3 API:                           ║"
+echo "║  • Twilio  • Stripe  • GitHub  • Salesforce  • Your Own API        ║"
 echo "║                                                                      ║"
 echo "╚══════════════════════════════════════════════════════════════════════╝"

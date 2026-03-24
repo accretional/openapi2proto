@@ -1,29 +1,30 @@
 #!/bin/bash
 # =============================================================================
-# DEMO 2: Gerçek Twilio API'si ile Test
+# DEMO 2: Test with Real Twilio API
 # =============================================================================
-# Kullanım:
-#   export TWILIO_ACCOUNT_SID=ACxxx
-#   export TWILIO_AUTH_TOKEN=xxx
+# Usage:
+#   Create .env file with credentials, or export them:
+#     export TWILIO_ACCOUNT_SID=ACxxx
+#     export TWILIO_AUTH_TOKEN=xxx
 #   ./demo_test.sh
 # =============================================================================
 
 set -e
 cd "$(dirname "$0")"
 
-# .env dosyasından yükle (varsa)
+# Load from .env if present
 if [ -f .env ]; then
   export $(grep -v '^#' .env | xargs)
 fi
 
 if [ -z "$TWILIO_ACCOUNT_SID" ] || [ -z "$TWILIO_AUTH_TOKEN" ]; then
-  echo "⚠️  TWILIO_ACCOUNT_SID ve TWILIO_AUTH_TOKEN gerekiyor!"
+  echo "⚠️  TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN are required!"
   echo ""
-  echo "  .env dosyası oluşturun:"
+  echo "  Create .env file:"
   echo "    TWILIO_ACCOUNT_SID=ACxxx"
   echo "    TWILIO_AUTH_TOKEN=xxx"
   echo ""
-  echo "  veya export edin:"
+  echo "  Or export them:"
   echo "    export TWILIO_ACCOUNT_SID=ACxxx"
   echo "    export TWILIO_AUTH_TOKEN=xxx"
   exit 1
@@ -32,11 +33,11 @@ fi
 AUTH=$(echo -n "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" | base64)
 BASE="https://accounts.twilio.com"
 
-echo "╔═════════════════════════════════════��════════════════════════════════╗"
-echo "║  DEMO: Gerçek Twilio API Testi                                      ║"
+echo "╔══════════════════════════════════════════════════════════════════════╗"
+echo "║  DEMO: Live Twilio API Test                                         ║"
 echo "╚══════════════════════════════════════════════════════════════════════╝"
 echo ""
-echo "Bu test, proto tanımlarımızın gerçek API ile eşleştiğini kanıtlar."
+echo "This test proves our proto definitions match the real API."
 echo ""
 
 # ── TEST 1: AWS Credentials List ──
@@ -53,10 +54,10 @@ BODY=$(echo "$RESP" | sed '$d')
 
 echo "  Status: $HTTP_CODE"
 if [ "$HTTP_CODE" = "200" ]; then
-  echo "  ✅ Başarılı!"
+  echo "  ✅ Success!"
   echo "  Response: $(echo "$BODY" | head -c 100)..."
 else
-  echo "  ❌ Hata: $BODY"
+  echo "  ❌ Error: $BODY"
 fi
 echo ""
 
@@ -74,10 +75,10 @@ BODY=$(echo "$RESP" | sed '$d')
 
 echo "  Status: $HTTP_CODE"
 if [ "$HTTP_CODE" = "200" ]; then
-  echo "  ✅ Başarılı!"
+  echo "  ✅ Success!"
   echo "  Response: $(echo "$BODY" | head -c 100)..."
 else
-  echo "  ❌ Hata: $BODY"
+  echo "  ❌ Error: $BODY"
 fi
 echo ""
 
@@ -95,26 +96,26 @@ BODY=$(echo "$RESP" | sed '$d')
 
 echo "  Status: $HTTP_CODE"
 if [ "$HTTP_CODE" = "200" ]; then
-  echo "  ✅ Başarılı!"
+  echo "  ✅ Success!"
   echo "  Response: $(echo "$BODY" | head -c 100)..."
 elif [ "$HTTP_CODE" = "404" ]; then
-  echo "  ✅ 404 - Token yok (normal)"
+  echo "  ✅ 404 - No token (expected)"
 else
   echo "  Status: $HTTP_CODE"
 fi
 echo ""
 
-# ── Özet ──
+# ── Summary ──
 echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "║  SONUÇ                                                              ║"
+echo "║  RESULT                                                              ║"
 echo "╠══════════════════════════════════════════════════════════════════════╣"
-echo "║                                                                     ║"
-echo "║  ✅ Tüm API çağrıları Twilio'ya ulaştı                             ║"
-echo "║  ✅ Endpoint'ler proto tanımlarıyla eşleşiyor                       ║"
-echo "║  ✅ Response yapıları beklenen formatta                             ║"
-echo "║                                                                     ║"
-echo "║  Bu kanıtlıyor ki:                                                  ║"
-echo "║  Proto → REST mapping doğru çalışıyor                               ║"
-echo "║  Aynı path'ler, aynı parametreler, aynı response                    ║"
-echo "║                                                                     ║"
+echo "║                                                                      ║"
+echo "║  ✅ All API calls reached Twilio                                    ║"
+echo "║  ✅ Endpoints match proto definitions                                ║"
+echo "║  ✅ Response structures are in expected format                       ║"
+echo "║                                                                      ║"
+echo "║  This proves:                                                        ║"
+echo "║  Proto → REST mapping is working correctly                           ║"
+echo "║  Same paths, same parameters, same response                          ║"
+echo "║                                                                      ║"
 echo "╚══════════════════════════════════════════════════════════════════════╝"

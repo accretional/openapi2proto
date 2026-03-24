@@ -13,7 +13,22 @@
 
 `openapi2proto` is built around `gnostic`'s OpenAPI parser and is completely **API-agnostic**.
 
-Current scope:
+## 🚀 Quick Demo
+
+```bash
+# 1. Full demo (proto generation + validation + stats)
+./demo.sh
+
+# 2. With live API testing (requires Twilio credentials)
+export TWILIO_ACCOUNT_SID=ACxxx
+export TWILIO_AUTH_TOKEN=xxx
+./demo.sh --test
+
+# 3. Just API testing
+./demo_test.sh
+```
+
+## 📋 Features
 
 - Parses OpenAPI v3 JSON/YAML with `github.com/google/gnostic/openapiv3`
 - Emits `.proto` services grouped by first tag or as a single service

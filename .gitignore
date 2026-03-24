@@ -1,0 +1,32 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+openapi2proto
+
+# Go
+*.test
+*.out
+vendor/
+go.work
+go.work.sum
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Generated code (users should regenerate)
+gen/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp/Test files
+/tmp/
+*.tmp
+*.log

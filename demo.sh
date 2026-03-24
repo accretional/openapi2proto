@@ -9,6 +9,11 @@
 
 cd "$(dirname "$0")"
 
+# .env dosyasından yükle (varsa)
+if [ -f .env ]; then
+  export $(grep -v '^#' .env | xargs)
+fi
+
 RUN_TEST=false
 if [ "$1" = "--test" ] || [ "$1" = "-t" ]; then
   RUN_TEST=true

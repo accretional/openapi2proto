@@ -30,3 +30,8 @@ Thumbs.db
 /tmp/
 *.tmp
 *.log
+
+# Environment variables (contains secrets)
+.env
+.env.local
+.env.*.local

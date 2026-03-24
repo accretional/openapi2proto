@@ -11,12 +11,21 @@
 set -e
 cd "$(dirname "$0")"
 
+# .env dosyasından yükle (varsa)
+if [ -f .env ]; then
+  export $(grep -v '^#' .env | xargs)
+fi
+
 if [ -z "$TWILIO_ACCOUNT_SID" ] || [ -z "$TWILIO_AUTH_TOKEN" ]; then
   echo "⚠️  TWILIO_ACCOUNT_SID ve TWILIO_AUTH_TOKEN gerekiyor!"
   echo ""
-  echo "  export TWILIO_ACCOUNT_SID=ACxxx"
-  echo "  export TWILIO_AUTH_TOKEN=xxx"
-  echo "  ./demo_test.sh"
+  echo "  .env dosyası oluşturun:"
+  echo "    TWILIO_ACCOUNT_SID=ACxxx"
+  echo "    TWILIO_AUTH_TOKEN=xxx"
+  echo ""
+  echo "  veya export edin:"
+  echo "    export TWILIO_ACCOUNT_SID=ACxxx"
+  echo "    export TWILIO_AUTH_TOKEN=xxx"
   exit 1
 fi
 

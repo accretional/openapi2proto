@@ -6,7 +6,7 @@ import (
 	openapiv3 "github.com/google/gnostic/openapiv3"
 )
 
-func ParseDocument(data []byte) (*openapiv3.Document, error) {
+func DecodeOpenAPIFromBytes(data []byte) (*openapiv3.Document, error) {
 	if json.Valid(data) {
 		var normalized any
 		if err := json.Unmarshal(data, &normalized); err == nil {

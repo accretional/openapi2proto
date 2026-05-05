@@ -353,6 +353,9 @@ func buildPathExprFromVars(pathTemplate string, reqMsg *messageDef) string {
 func renderQuerySetter(out *strings.Builder, f *fieldDef) {
 	getter := protoNameToGoName("Get" + toCamel(f.Name))
 	key := f.Name
+	if f.OrigName != "" {
+		key = f.OrigName
+	}
 
 	if f.Repeated {
 		switch f.Type {

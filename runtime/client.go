@@ -100,9 +100,9 @@ func StatusError(data []byte, httpStatus int) error {
 		code = codes.InvalidArgument
 	}
 
-	msg := fmt.Sprintf("cloudflare: HTTP %d", httpStatus)
+	msg := fmt.Sprintf("api: HTTP %d", httpStatus)
 	if len(env.Errors) > 0 {
-		msg = fmt.Sprintf("cloudflare: %s (code %d)", env.Errors[0].Message, env.Errors[0].Code)
+		msg = fmt.Sprintf("api: %s (code %d)", env.Errors[0].Message, env.Errors[0].Code)
 	}
 	return status.Error(code, msg)
 }
@@ -143,7 +143,7 @@ func MarshalBodyAny(v any) ([]byte, error) {
 	return json.Marshal(v)
 }
 
-// UnmarshalInto decodes a Cloudflare API response envelope into any Go value.
+// UnmarshalInto decodes an API response envelope into any Go value.
 // It strips "errors" and "messages" from the top level, extracts the "result"
 // field if present, then uses encoding/json to decode into v.
 func UnmarshalInto(data []byte, v any) error {

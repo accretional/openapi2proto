@@ -1,88 +1,80 @@
 # openapi2proto
 
-**Universal OpenAPI v3 → Protobuf/gRPC Converter**
+Converts any OpenAPI v3 specification into Protocol Buffer (`.proto`) files
+with gRPC service definitions and optional Go service stubs that proxy gRPC
+calls to the underlying REST API.
 
-`openapi2proto` is a **general-purpose** tool that converts any OpenAPI v3 spec to Protocol Buffer (`.proto`) files with gRPC service definitions. Built on Google's `gnostic` parser, it works with **any REST API** — not just Twilio.
+Built on Google's [gnostic](https://github.com/google/gnostic) parser.
+API-agnostic — works with any OpenAPI v3 spec.
 
-## ✨ Works With Any API
+## What it does
 
-- ✅ **Twilio** (56 services, 3000+ messages) — included as examples
-- ✅ **Stripe** — Payment APIs
-- ✅ **GitHub** — Repository, Issues, PRs
-- ✅ **Your API** — Any OpenAPI v3 spec
-
-`openapi2proto` is built around `gnostic`'s OpenAPI parser and is completely **API-agnostic**.
-
-## 🚀 Quick Demo
-
-```bash
-# 1. Full demo (proto generation + validation + stats)
-./demo.sh
-
-# 2. With live API testing
-#    Option A: Create .env file
-echo "TWILIO_ACCOUNT_SID=ACxxx" > .env
-echo "TWILIO_AUTH_TOKEN=xxx" >> .env
-./demo.sh --test
-
-#    Option B: Export directly
-export TWILIO_ACCOUNT_SID=ACxxx
-export TWILIO_AUTH_TOKEN=xxx
-./demo.sh --test
-
-# 3. Just API testing
-./demo_test.sh
-```
-
-## 📋 Features
-
-- Parses OpenAPI v3 JSON/YAML with `github.com/google/gnostic/openapiv3`
-- Emits `.proto` services grouped by first tag or as a single service
-- Generates request/response wrapper messages for HTTP operations
+- Parses OpenAPI v3 JSON or YAML specs
+- Emits `.proto` files with gRPC service definitions grouped by tag (or as a single service)
+- Generates request/response wrapper messages for each HTTP operation
 - Lifts component schemas and inline schemas into protobuf messages
-- Emits `google.api.http` annotations so the generated gRPC surface can be
-  transcoded back to REST when needed
-- Handles local `#/components/...` refs for schemas, parameters, responses,
-  request bodies, and headers
+- Adds `google.api.http` annotations for REST transcoding
+- Optionally generates Go service stubs that implement each RPC as a REST call
+  through a shared `runtime.Client`
 
-Current limitations:
+## Usage
 
-- OpenAPI v3 only
-- External `$ref` targets are not resolved
-- `oneOf` and `anyOf` currently fall back to `google.protobuf.Struct`
-- Canonical success response only; non-2xx error schemas are not modeled yet
+```
+go run ./cmd/openapi2proto [flags]
+```
 
-Generate one spec:
+### Flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-input` | Path to OpenAPI v3 spec (JSON or YAML) | required |
+| `-output` | Output `.proto` file path | stdout |
+| `-package` | Proto package name | derived from input filename |
+| `-go_package` | Go package option (`path;alias`) | derived from package |
+| `-grouping` | Service grouping: `tag` or `single` | `tag` |
+| `-no_http` | Disable `google.api.http` annotations | false |
+| `-service_out` | Output path for generated Go service file | (none) |
+| `-go_module` | Go module path of the consuming project | (none) |
+| `-runtime_import` | Go import path for the runtime package | `github.com/accretional/openapi2proto/runtime` |
+
+### Examples
+
+Generate a proto file:
 
 ```bash
-cd openapi2proto
 go run ./cmd/openapi2proto \
-  -input ../twilio-oai/spec/json/twilio_voice_v1.json \
-  -output ./generated/twilio/voice/v1/twilio_voice_v1.proto \
-  -package twilio.voice.v1
+  -input spec.json \
+  -output proto/myapi/v1/myapi.proto \
+  -package myapi.v1
 ```
 
-Generate all checked-in Twilio specs:
+Generate a proto file with a Go service stub:
 
 ```bash
-cd openapi2proto
-./scripts/generate_twilio_protos.sh
+go run ./cmd/openapi2proto \
+  -input spec.json \
+  -output proto/myapi/v1/myapi.proto \
+  -package myapi.v1 \
+  -go_package "myapi/v1;myapiv1" \
+  -service_out service/myapi/server.go \
+  -go_module github.com/myorg/myproject \
+  -runtime_import github.com/myorg/myproject/internal/runtime
 ```
 
-Validate a generated file:
+### Runtime package
 
-```bash
-protoc \
-  --proto_path=. \
-  --proto_path=third_party \
-  --proto_path=../gnostic/third_party \
-  --descriptor_set_out=/tmp/out.pb \
-  generated/twilio/voice/v1/twilio_voice_v1.proto
-```
+The `runtime/` directory contains a generic HTTP client (`runtime.Client`) used
+by generated Go service stubs. Copy it into your project (e.g. `internal/runtime/`)
+and point `-runtime_import` at that path.
 
-Validate every generated Twilio proto:
+## Limitations
 
-```bash
-cd openapi2proto
-./scripts/validate_generated_protos.sh
-```
+- OpenAPI v3 only (not v2)
+- External `$ref` targets are not resolved
+- `oneOf` and `anyOf` fall back to `google.protobuf.Struct`
+- Only the canonical success response is modeled; non-2xx error schemas are not emitted
+
+## Projects using openapi2proto
+
+- [proto-cloudflare](https://github.com/accretional/proto-cloudflare) — gRPC proxy for the Cloudflare API (~220 services)
+- [proto-openai](https://github.com/accretional/proto-openai) — gRPC proxy for the OpenAI API (35 services, 242 RPCs)

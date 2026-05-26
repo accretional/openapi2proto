@@ -14,5 +14,3 @@ require (
 	golang.org/x/sys v0.35.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250811160224-6b04f9b4fc78 // indirect
 )
-
-replace github.com/google/gnostic => ../gnostic

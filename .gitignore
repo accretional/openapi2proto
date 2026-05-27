@@ -4,6 +4,7 @@
 *.so
 *.dylib
 /openapi2proto
+/schemagen
 
 # Go
 *.test
@@ -28,6 +29,7 @@ Thumbs.db
 
 # Temp/Test files
 /tmp/
+temp/
 *.tmp
 *.log
 

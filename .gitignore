@@ -6,6 +6,7 @@
 /openapi2proto
 /schemagen
 /generate-gnostic
+/schema.json
 
 # Go
 *.test

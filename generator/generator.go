@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	openapiv3 "github.com/google/gnostic/openapiv3"
+	openapiv3 "github.com/accretional/openapi2proto/internal/openapiv3"
 )
 
 type Config struct {

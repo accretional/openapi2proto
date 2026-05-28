@@ -127,6 +127,12 @@ func main() {
 	// Fix the contact object
 	fixContactObject(schema)
 
+	// In OpenAPI 3.1, $ref is now a keyword within Schema itself, so the spec
+	// defines many schema-typed fields as just "Schema" instead of "Schema | Reference".
+	// However, the generator pipeline and proto-openai expect SchemaOrReference wrappers.
+	// Upgrade these fields to schemaOrReference and schemas→schemasOrReferences for compat.
+	upgradeSchemaOrRefCompat(schema)
+
 	// Write the schema as JSON
 	output := schema.JSONString()
 	err = os.WriteFile("schema.json", []byte(output), 0644)
@@ -240,6 +246,74 @@ func addSchemaKeywords(schema *jsonschema.Schema) {
 	schemaObject.AddProperty("default", &jsonschema.Schema{Ref: stringptr("#/definitions/defaultType")})
 	schemaObject.AddProperty("description", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("string")})
 	schemaObject.AddProperty("format", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("string")})
+
+	// JSON Schema 2020-12 / OpenAPI 3.1 keywords
+	schemaObject.AddProperty("const", &jsonschema.Schema{Ref: stringptr("#/definitions/defaultType")})
+	schemaObject.AddProperty("$id", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("string")})
+	schemaObject.AddProperty("$anchor", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("string")})
+	schemaObject.AddProperty("$comment", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("string")})
+	schemaObject.AddProperty("$schema", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("string")})
+	schemaObject.AddProperty("$dynamicRef", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("string")})
+	schemaObject.AddProperty("$dynamicAnchor", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("string")})
+	schemaObject.AddProperty("$recursiveRef", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("string")})
+	schemaObject.AddProperty("$recursiveAnchor", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("boolean")})
+	schemaObject.AddProperty("$vocabulary", &jsonschema.Schema{
+		Type: jsonschema.NewStringOrStringArrayWithString("object"),
+		AdditionalProperties: jsonschema.NewSchemaOrBooleanWithSchema(
+			&jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("boolean")}),
+	})
+	schemaObject.AddProperty("$defs", &jsonschema.Schema{
+		Type: jsonschema.NewStringOrStringArrayWithString("object"),
+		AdditionalProperties: jsonschema.NewSchemaOrBooleanWithSchema(
+			&jsonschema.Schema{Ref: stringptr("#/definitions/schemaOrReference")}),
+	})
+	schemaObject.AddProperty("propertyNames", &jsonschema.Schema{Ref: stringptr("#/definitions/schemaOrReference")})
+	schemaObject.AddProperty("prefixItems", schemagen.ArrayOfSchema())
+	schemaObject.AddProperty("contains", &jsonschema.Schema{Ref: stringptr("#/definitions/schemaOrReference")})
+	schemaObject.AddProperty("if", &jsonschema.Schema{Ref: stringptr("#/definitions/schemaOrReference")})
+	schemaObject.AddProperty("then", &jsonschema.Schema{Ref: stringptr("#/definitions/schemaOrReference")})
+	schemaObject.AddProperty("else", &jsonschema.Schema{Ref: stringptr("#/definitions/schemaOrReference")})
+	schemaObject.AddProperty("dependentSchemas", &jsonschema.Schema{
+		Type: jsonschema.NewStringOrStringArrayWithString("object"),
+		AdditionalProperties: jsonschema.NewSchemaOrBooleanWithSchema(
+			&jsonschema.Schema{Ref: stringptr("#/definitions/schemaOrReference")}),
+	})
+	schemaObject.AddProperty("dependentRequired", &jsonschema.Schema{
+		Type: jsonschema.NewStringOrStringArrayWithString("object"),
+		AdditionalProperties: jsonschema.NewSchemaOrBooleanWithSchema(
+			&jsonschema.Schema{
+				Type: jsonschema.NewStringOrStringArrayWithString("array"),
+				Items: &jsonschema.SchemaOrSchemaArray{
+					Schema: &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("string")},
+				},
+			}),
+	})
+	schemaObject.AddProperty("contentEncoding", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("string")})
+	schemaObject.AddProperty("contentMediaType", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("string")})
+	{
+		oneOf := make([]*jsonschema.Schema, 0)
+		oneOf = append(oneOf, &jsonschema.Schema{Ref: stringptr("#/definitions/schemaOrReference")})
+		oneOf = append(oneOf, &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("boolean")})
+		schemaObject.AddProperty("unevaluatedItems", &jsonschema.Schema{OneOf: &oneOf})
+	}
+	{
+		oneOf := make([]*jsonschema.Schema, 0)
+		oneOf = append(oneOf, &jsonschema.Schema{Ref: stringptr("#/definitions/schemaOrReference")})
+		oneOf = append(oneOf, &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("boolean")})
+		schemaObject.AddProperty("unevaluatedProperties", &jsonschema.Schema{OneOf: &oneOf})
+	}
+	schemaObject.AddProperty("examples", &jsonschema.Schema{
+		Type: jsonschema.NewStringOrStringArrayWithString("array"),
+		Items: &jsonschema.SchemaOrSchemaArray{
+			Schema: &jsonschema.Schema{Ref: stringptr("#/definitions/defaultType")},
+		},
+	})
+
+	// OpenAPI Schema Object keywords (beyond JSON Schema)
+	schemaObject.AddProperty("nullable", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("boolean")})
+	schemaObject.AddProperty("deprecated", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("boolean")})
+	schemaObject.AddProperty("readOnly", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("boolean")})
+	schemaObject.AddProperty("writeOnly", &jsonschema.Schema{Type: jsonschema.NewStringOrStringArrayWithString("boolean")})
 }
 
 func fixContentObject(schema *jsonschema.Schema) {
@@ -264,6 +338,46 @@ func fixContactObject(schema *jsonschema.Schema) {
 			urlProperty.Format = stringptr("uri")
 		}
 	}
+}
+
+// upgradeSchemaOrRefCompat rewrites fields that 3.1 changed from "Schema | Reference"
+// to just "Schema" so they still use the schemaOrReference union type. This keeps the
+// generated proto/Go compatible with the generator pipeline that expects SchemaOrReference.
+func upgradeSchemaOrRefCompat(schema *jsonschema.Schema) {
+	schemaOrRef := stringptr("#/definitions/schemaOrReference")
+	schemasOrRefs := stringptr("#/definitions/schemasOrReferences")
+
+	// components.schemas: schemas → schemasOrReferences
+	compDef := schema.DefinitionWithName("components")
+	if compDef != nil {
+		prop := compDef.PropertyWithName("schemas")
+		if prop != nil && prop.Ref != nil && *prop.Ref == "#/definitions/schemas" {
+			prop.Ref = schemasOrRefs
+		}
+	}
+	// Ensure schemasOrReferences definition exists (map of schemaOrReference)
+	if schema.DefinitionWithName("schemasOrReferences") == nil {
+		s := &jsonschema.Schema{
+			Type: jsonschema.NewStringOrStringArrayWithString("object"),
+			AdditionalProperties: jsonschema.NewSchemaOrBooleanWithSchema(
+				&jsonschema.Schema{Ref: schemaOrRef}),
+		}
+		*schema.Definitions = append(*schema.Definitions, jsonschema.NewNamedSchema("schemasOrReferences", s))
+	}
+
+	// mediaType.schema, parameter.schema, header.schema: schema → schemaOrReference
+	for _, defName := range []string{"mediaType", "parameter", "header"} {
+		def := schema.DefinitionWithName(defName)
+		if def == nil {
+			continue
+		}
+		prop := def.PropertyWithName("schema")
+		if prop != nil && prop.Ref != nil && *prop.Ref == "#/definitions/schema" {
+			prop.Ref = schemaOrRef
+		}
+	}
+
+	// discriminator.mapping uses strings already, no change needed.
 }
 
 func stringptr(input string) *string {

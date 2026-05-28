@@ -3,14 +3,20 @@ package generator
 import (
 	"encoding/json"
 
-	openapiv3 "github.com/google/gnostic/openapiv3"
+	openapiv3 "github.com/accretional/openapi2proto/internal/openapiv3"
 )
 
 func DecodeOpenAPIFromBytes(data []byte) (*openapiv3.Document, error) {
+	// Pre-process JSON to handle constructs the parser can't handle natively.
+	// Unlike the old normalize31 (which stripped all 3.1 keywords), this only
+	// handles structural patterns the gnostic parsing architecture can't support:
+	// - type arrays, null branches, $ref siblings, non-standard vendor keywords.
+	// Keywords like const, $recursiveRef, propertyNames, $defs, etc. are now
+	// parsed natively by the generated openapiv3 package.
 	if json.Valid(data) {
 		var raw any
 		if err := json.Unmarshal(data, &raw); err == nil {
-			normalize31(raw)
+			normalizeStructural(raw)
 			if remarshal, err := json.Marshal(raw); err == nil {
 				data = remarshal
 			}
@@ -19,46 +25,31 @@ func DecodeOpenAPIFromBytes(data []byte) (*openapiv3.Document, error) {
 	return openapiv3.ParseDocument(data)
 }
 
-// normalize31 recursively patches a decoded OpenAPI document to remove
-// OpenAPI 3.1 / JSON Schema 2020-12 constructs that gnostic's openapiv3
-// parser does not support. The transformations are lossy but preserve
-// enough structure for proto generation.
-func normalize31(v any) {
+// normalizeStructural recursively rewrites structural patterns that the
+// gnostic parser architecture cannot represent.
+func normalizeStructural(v any) {
 	switch node := v.(type) {
 	case map[string]any:
-		normalize31Schema(node)
+		normalizeStructuralSchema(node)
 		for _, child := range node {
-			normalize31(child)
+			normalizeStructural(child)
 		}
 	case []any:
 		for _, child := range node {
-			normalize31(child)
+			normalizeStructural(child)
 		}
 	}
 }
 
-func normalize31Schema(m map[string]any) {
-	// Remove keywords gnostic does not recognise.
-	delete(m, "$recursiveAnchor")
-	delete(m, "propertyNames")
+func normalizeStructuralSchema(m map[string]any) {
+	// Remove non-standard keywords that are not x-prefixed.
 	delete(m, "optional")
-	delete(m, "x-stainless-const")
-
-	// $recursiveRef → treat as opaque object.
-	if _, ok := m["$recursiveRef"]; ok {
-		delete(m, "$recursiveRef")
-		m["type"] = "object"
-	}
-
-	// const → single-element enum.
-	if val, ok := m["const"]; ok {
-		delete(m, "const")
-		if _, hasEnum := m["enum"]; !hasEnum {
-			m["enum"] = []any{val}
-		}
-	}
+	delete(m, "min_items")
+	delete(m, "max_items")
 
 	// type as array (e.g. ["string", "null"]) → pick first non-null type.
+	// The parser's TypeItem handles string-or-array, but the schema defines
+	// type as a simple string, so array values fail validation.
 	if arr, ok := m["type"].([]any); ok {
 		var first string
 		for _, t := range arr {
@@ -73,8 +64,8 @@ func normalize31Schema(m map[string]any) {
 		m["type"] = first
 	}
 
-	// $ref alongside other properties: gnostic treats $ref as exclusive.
-	// Strip everything except $ref so gnostic can parse it.
+	// $ref alongside other properties: the parser treats $ref as exclusive.
+	// Strip siblings so the parser can handle it.
 	if _, hasRef := m["$ref"]; hasRef {
 		for k := range m {
 			if k != "$ref" {
@@ -84,7 +75,8 @@ func normalize31Schema(m map[string]any) {
 		return
 	}
 
-	// anyOf / oneOf with a {type: "null"} branch → collapse nullable.
+	// anyOf / oneOf with a {type: "null"} branch → collapse to non-null branch.
+	// The parser doesn't model nullable types; collapsing is the best we can do.
 	for _, combo := range []string{"anyOf", "oneOf"} {
 		items, ok := m[combo].([]any)
 		if !ok || len(items) == 0 {
@@ -104,17 +96,11 @@ func normalize31Schema(m map[string]any) {
 			continue
 		}
 		if len(nonNull) == 1 {
-			// Single remaining branch → merge it into this schema.
 			if replacement, ok := nonNull[0].(map[string]any); ok {
 				delete(m, combo)
 				for k, v := range replacement {
 					m[k] = v
 				}
-				// Re-clean: the merged branch may introduce unsupported keys.
-				delete(m, "propertyNames")
-				delete(m, "$recursiveAnchor")
-				delete(m, "optional")
-				delete(m, "x-stainless-const")
 			}
 		} else if len(nonNull) == 0 {
 			delete(m, combo)
@@ -124,8 +110,7 @@ func normalize31Schema(m map[string]any) {
 		}
 	}
 
-	// If anyOf/oneOf remain and there's no type or properties, treat as
-	// opaque object so gnostic doesn't reject nested schemas.
+	// If anyOf/oneOf remain with no type or properties, treat as opaque object.
 	for _, combo := range []string{"anyOf", "oneOf"} {
 		if _, ok := m[combo]; ok {
 			if _, hasType := m["type"]; !hasType {
@@ -137,18 +122,11 @@ func normalize31Schema(m map[string]any) {
 		}
 	}
 
-	// Object with type + oneOf/anyOf that just refines via composition:
-	// gnostic handles the properties but chokes on the composition.
+	// Object with type + oneOf/anyOf composition: drop the composition.
 	if m["type"] == "object" {
 		if _, hasProps := m["properties"]; hasProps {
 			delete(m, "oneOf")
 			delete(m, "anyOf")
 		}
-	}
-
-	// Strip non-array min_items / max_items.
-	if m["type"] != "array" {
-		delete(m, "min_items")
-		delete(m, "max_items")
 	}
 }

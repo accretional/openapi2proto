@@ -5,6 +5,7 @@
 *.dylib
 /openapi2proto
 /schemagen
+/generate-gnostic
 
 # Go
 *.test

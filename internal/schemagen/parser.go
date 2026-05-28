@@ -67,6 +67,13 @@ func parseFixedFields(input string, schemaObject *SchemaObject) {
 			if fieldName == "Field Name" || strings.HasPrefix(fieldName, "---") || strings.HasPrefix(fieldName, "----") {
 				continue
 			}
+			// skip rows from non-field tables (descriptive tables with backtick-wrapped
+			// names, markdown links, or other non-identifier characters).
+			// Valid field names are camelCase identifiers optionally prefixed with $.
+			validFieldName := regexp.MustCompile(`^[$]?[a-zA-Z][a-zA-Z0-9]*$`)
+			if !validFieldName.MatchString(fieldName) {
+				continue
+			}
 
 			if len(parts) == 3 || len(parts) == 4 {
 				// expected column count

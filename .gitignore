@@ -3,7 +3,7 @@
 *.dll
 *.so
 *.dylib
-openapi2proto
+/openapi2proto
 
 # Go
 *.test

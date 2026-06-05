@@ -85,7 +85,7 @@ func TestGenerateSampleSpec(t *testing.T) {
 	for _, want := range []string{
 		"package demo.api;",
 		"service WidgetService",
-		"rpc FetchWidget(FetchWidgetRequest) returns (FetchWidgetResponse)",
+		"rpc FetchWidget(.demo.api.FetchWidgetRequest) returns (.demo.api.FetchWidgetResponse)",
 		"string widget_sid = 1;",
 		"int32 page_size = 2;",
 		"map<string, string> attributes = 2;",

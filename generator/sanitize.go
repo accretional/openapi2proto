@@ -1,6 +1,8 @@
 package generator
 
 import (
+	"strings"
+
 	yaml "go.yaml.in/yaml/v3"
 )
 
@@ -49,7 +51,19 @@ func sanitizeForGnostic(root *yaml.Node) {
 		for i := 1; i < len(paths.Content); i += 2 {
 			sanitizePathItem(paths.Content[i])
 		}
+	} else {
+		// gnostic's 3.0 model requires a "paths" property. Some 3.1 specs are
+		// webhooks-only (e.g. Adyen MarketPayNotificationService) and omit it;
+		// since we strip 3.1 "webhooks", inject an empty Paths Object so the
+		// document still validates and its component messages are emitted.
+		setKey(doc, "paths", &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"})
 	}
+
+	// Drop any externalDocs object that lacks the required "url" property.
+	// gnostic rejects such objects; they appear both in source specs and as a
+	// byproduct of the Swagger 2.0 -> 3.0 conversion (e.g. Azure ServiceBus,
+	// whose per-operation externalDocs carry only a description).
+	dropInvalidExternalDocs(doc)
 
 	// Tag Objects require a scalar string "description". Some specs (e.g.
 	// DigitalOcean's bundled output) leave an unresolved external $ref map there;
@@ -74,6 +88,31 @@ func sanitizeForGnostic(root *yaml.Node) {
 	}
 
 	walkSchemas(doc)
+}
+
+// dropInvalidExternalDocs recursively removes any "externalDocs" object that is
+// missing its required "url" property, which gnostic's 3.0 model rejects. Values
+// under example/default/enum/examples are skipped so user data is never touched.
+func dropInvalidExternalDocs(n *yaml.Node) {
+	switch n.Kind {
+	case yaml.MappingNode:
+		if ed := mapValue(n, "externalDocs"); ed != nil &&
+			ed.Kind == yaml.MappingNode && !hasKey(ed, "url") {
+			deleteKey(n, "externalDocs")
+		}
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			switch n.Content[i].Value {
+			case "example", "default", "enum", "examples":
+				// Raw user data — do not descend.
+			default:
+				dropInvalidExternalDocs(n.Content[i+1])
+			}
+		}
+	case yaml.SequenceNode, yaml.DocumentNode:
+		for _, c := range n.Content {
+			dropInvalidExternalDocs(c)
+		}
+	}
 }
 
 // documentRoot unwraps a yaml DocumentNode to its first content node.
@@ -172,7 +211,73 @@ func sanitizePathItem(item *yaml.Node) {
 			continue
 		}
 		stripUnknownKeys(op, operationAllowed)
+		if resp := mapValue(op, "responses"); resp != nil {
+			normalizeResponses(resp)
+		}
 	}
+}
+
+// responseRangeKeys maps non-standard response range keys to the OpenAPI 3.0
+// canonical uppercase wildcard form gnostic requires (e.g. lowercase "4xx" or
+// "4XX"/"4xX" -> "4XX"). Several specs (e.g. Cloudflare) use the lowercase
+// form, which gnostic rejects.
+var responseRangeKeys = map[string]string{
+	"1xx": "1XX", "2xx": "2XX", "3xx": "3XX", "4xx": "4XX", "5xx": "5XX",
+}
+
+// validResponseKey reports whether key is a Responses Object key gnostic's
+// strict 3.0 model accepts: "default", a three-digit integer status code, or an
+// uppercase wildcard range (1XX..5XX).
+func validResponseKey(key string) bool {
+	if key == "default" {
+		return true
+	}
+	if responseRangeKeys[key] == key { // already canonical uppercase wildcard
+		return true
+	}
+	if len(key) == 3 {
+		for i := 0; i < 3; i++ {
+			if key[i] < '0' || key[i] > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// normalizeResponses canonicalizes the keys of a Responses Object so gnostic can
+// ingest it. Non-standard range keys (lowercase "4xx", mixed case) are folded to
+// the uppercase wildcard form ("4XX"); any remaining keys gnostic does not
+// recognize are dropped along with their value. x- extensions are preserved.
+func normalizeResponses(resp *yaml.Node) {
+	if resp == nil || resp.Kind != yaml.MappingNode {
+		return
+	}
+	out := resp.Content[:0]
+	for i := 0; i+1 < len(resp.Content); i += 2 {
+		keyNode := resp.Content[i]
+		key := keyNode.Value
+		if isExtension(key) {
+			out = append(out, resp.Content[i], resp.Content[i+1])
+			continue
+		}
+		if canon, ok := responseRangeKeys[strings.ToLower(key)]; ok {
+			keyNode.Value = canon
+			keyNode.Tag = "!!str"
+			out = append(out, keyNode, resp.Content[i+1])
+			continue
+		}
+		if validResponseKey(key) {
+			// Force string tag so purely numeric codes (e.g. 200) don't render
+			// as YAML integers, which gnostic rejects as response keys.
+			keyNode.Tag = "!!str"
+			out = append(out, keyNode, resp.Content[i+1])
+			continue
+		}
+		// Unknown / non-standard response key gnostic rejects: drop it.
+	}
+	resp.Content = out
 }
 
 // validScalarTypes is the set of OpenAPI 3.0 Schema Object "type" values.
@@ -553,6 +658,15 @@ func sanitizeSwaggerV2(n *yaml.Node) {
 	case yaml.MappingNode:
 		if items := mapValue(n, "items"); items != nil && items.Kind == yaml.SequenceNode {
 			setKey(n, "items", collapseItemsArray(items))
+		}
+		// kin-openapi's v2->v3 converter aborts on external $refs (those that
+		// point at a sibling file rather than "#/definitions/..."). Multi-file
+		// Azure specs use these heavily. We cannot resolve the sibling file, so
+		// per the partial-conversion policy replace the external $ref with an
+		// empty schema, which downstream renders as google.protobuf.Struct.
+		if ref := mapValue(n, "$ref"); ref != nil && ref.Kind == yaml.ScalarNode &&
+			ref.Value != "" && !strings.HasPrefix(ref.Value, "#") {
+			deleteKey(n, "$ref")
 		}
 		for i := 1; i < len(n.Content); i += 2 {
 			sanitizeSwaggerV2(n.Content[i])

@@ -31,7 +31,7 @@ func (g *generator) render() []byte {
 		out.WriteString("\n")
 	}
 	for _, name := range g.serviceOrder {
-		renderService(&out, g.services[name])
+		renderService(&out, g.services[name], g.cfg.PackageName)
 		out.WriteString("\n")
 	}
 	return []byte(out.String())
@@ -59,12 +59,23 @@ func renderMessage(out *strings.Builder, msg *messageDef) {
 	out.WriteString("}\n")
 }
 
-func renderService(out *strings.Builder, svc *serviceDef) {
+func renderService(out *strings.Builder, svc *serviceDef, pkg string) {
 	writeComment(out, svc.Comment, 0)
 	out.WriteString(fmt.Sprintf("service %s {\n", svc.Name))
 	for _, method := range svc.Methods {
 		writeComment(out, method.Comment, 1)
-		out.WriteString(fmt.Sprintf("  rpc %s(%s) returns (%s)", method.Name, method.RequestType, method.ResponseType))
+		// Fully-qualify the request/response message types with a leading
+		// ".package." prefix. Proto name resolution searches enclosing scopes
+		// first, so an RPC whose method name collides with a top-level message
+		// name (e.g. a "GetSslCertificateRequest" operation alongside a
+		// "GetSslCertificate" operation, which both want the message
+		// "GetSslCertificateRequest") would otherwise resolve the bare type to
+		// the sibling method and fail with "not a message type". The absolute
+		// reference sidesteps that collision.
+		out.WriteString(fmt.Sprintf("  rpc %s(%s) returns (%s)",
+			method.Name,
+			qualifyType(method.RequestType, pkg),
+			qualifyType(method.ResponseType, pkg)))
 		if method.HTTP == nil {
 			out.WriteString(";\n")
 			continue
@@ -90,6 +101,17 @@ func renderService(out *strings.Builder, svc *serviceDef) {
 		out.WriteString("  }\n")
 	}
 	out.WriteString("}\n")
+}
+
+// qualifyType returns an absolute (leading-dot) reference to a locally
+// generated message type so proto name resolution cannot shadow it with a
+// sibling method name. Already-qualified names (containing a ".", e.g.
+// google.protobuf.Empty, or already absolute) are returned unchanged.
+func qualifyType(typeName, pkg string) string {
+	if pkg == "" || strings.Contains(typeName, ".") {
+		return typeName
+	}
+	return "." + pkg + "." + typeName
 }
 
 func writeComment(out *strings.Builder, comment string, indent int) {

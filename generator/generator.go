@@ -594,6 +594,13 @@ func responseRank(code string) int {
 	if code == "default" {
 		return 1000
 	}
+	// Handle non-standard wildcard codes like "2XX", "2xx", "2xX" — treat as
+	// a generic 2xx success response ranked just below explicit 200 codes.
+	if len(code) == 3 && (code[0] == '2') &&
+		(code[1] == 'x' || code[1] == 'X') &&
+		(code[2] == 'x' || code[2] == 'X') {
+		return 299
+	}
 	n, err := strconv.Atoi(code)
 	if err != nil {
 		return 2000
@@ -721,6 +728,25 @@ func (g *generator) protoTypeForSchema(nameHint string, schemaRef *openapiv3.Sch
 		if kind != "schemas" {
 			return protoType{}, fmt.Errorf("unsupported schema ref %q", ref.GetXRef())
 		}
+		// If the referenced schema is a bare array wrapper, inline it as repeated
+		// instead of generating a named wrapper message.
+		if refSchemaRef := g.refs.schemas[name]; refSchemaRef != nil {
+			if refSchema := refSchemaRef.GetSchema(); refSchema != nil {
+				if (refSchema.GetType() == "array" || refSchema.GetItems() != nil) &&
+					!isObjectSchema(refSchema) && !isMapSchema(refSchema) {
+					item := firstItem(refSchema)
+					itemType, err := g.protoTypeForSchema(nameHint+"Item", item)
+					if err != nil {
+						return protoType{}, err
+					}
+					// Ensure the named message is still registered (for completeness)
+					if _, err2 := g.ensureNamedSchemaMessage(name, refSchemaRef); err2 != nil {
+						return protoType{}, err2
+					}
+					return protoType{Type: itemType.Type, Repeated: true}, nil
+				}
+			}
+		}
 		typeName, err := g.ensureNamedSchemaMessage(name, g.refs.schemas[name])
 		if err != nil {
 			return protoType{}, err
@@ -752,6 +778,11 @@ func (g *generator) protoTypeForInlineSchema(nameHint string, schema *openapiv3.
 	}
 	if schema.GetType() == "array" || schema.GetItems() != nil {
 		item := firstItem(schema)
+		// Freeform object array items → repeated google.protobuf.Struct
+		if itemSchema := item.GetSchema(); itemSchema != nil && isFreeformObject(itemSchema) {
+			g.imports["google/protobuf/struct.proto"] = true
+			return protoType{Type: "google.protobuf.Struct", Repeated: true}, nil
+		}
 		itemType, err := g.protoTypeForSchema(nameHint+"Item", item)
 		if err != nil {
 			return protoType{}, err
@@ -764,10 +795,6 @@ func (g *generator) protoTypeForInlineSchema(nameHint string, schema *openapiv3.
 			return protoType{Type: wrapperName, Repeated: true}, nil
 		}
 		return protoType{Type: itemType.Type, Repeated: true}, nil
-	}
-	if len(schema.GetAnyOf()) > 0 || len(schema.GetOneOf()) > 0 {
-		g.imports["google/protobuf/struct.proto"] = true
-		return protoType{Type: "google.protobuf.Struct"}, nil
 	}
 	return scalarProtoType(schema.GetType(), schema.GetFormat()), nil
 }
@@ -817,7 +844,21 @@ func isObjectSchema(schema *openapiv3.Schema) bool {
 	if schema.GetProperties() != nil && len(schema.GetProperties().GetAdditionalProperties()) > 0 {
 		return true
 	}
-	return len(schema.GetAllOf()) > 0
+	return len(schema.GetAllOf()) > 0 ||
+		len(schema.GetAnyOf()) > 0 ||
+		len(schema.GetOneOf()) > 0
+}
+
+func isFreeformObject(schema *openapiv3.Schema) bool {
+	if schema == nil {
+		return false
+	}
+	return schema.GetType() == "object" &&
+		(schema.GetProperties() == nil || len(schema.GetProperties().GetAdditionalProperties()) == 0) &&
+		schema.GetAdditionalProperties() == nil &&
+		len(schema.GetAllOf()) == 0 &&
+		len(schema.GetAnyOf()) == 0 &&
+		len(schema.GetOneOf()) == 0
 }
 
 func isMapSchema(schema *openapiv3.Schema) bool {
@@ -941,6 +982,11 @@ func (g *generator) fillMessageFromSchema(msg *messageDef, schema *openapiv3.Sch
 		})
 		return nil
 	}
+	if isFreeformObject(schema) {
+		g.imports["google/protobuf/struct.proto"] = true
+		msg.Fields = append(msg.Fields, &fieldDef{Name: "data", Type: "google.protobuf.Struct", Number: 1, Comment: "Unstructured object."})
+		return nil
+	}
 	pt := scalarProtoType(schema.GetType(), schema.GetFormat())
 	msg.Fields = append(msg.Fields, &fieldDef{
 		Name:    "value",
@@ -972,27 +1018,39 @@ func (g *generator) collectProperties(schema *openapiv3.Schema) ([]*openapiv3.Na
 		if additional == nil && current.GetAdditionalProperties() != nil {
 			additional = current.GetAdditionalProperties()
 		}
-		for _, item := range current.GetAllOf() {
-			if item.GetReference() != nil {
-				kind, name, err := parseRef(item.GetReference().GetXRef())
-				if err != nil {
-					return err
-				}
-				if kind != "schemas" {
+		visitItems := func(items []*openapiv3.SchemaOrReference) error {
+			for _, item := range items {
+				if item.GetReference() != nil {
+					kind, name, err := parseRef(item.GetReference().GetXRef())
+					if err != nil {
+						return err
+					}
+					if kind != "schemas" {
+						continue
+					}
+					target := g.refs.schemas[name]
+					if target == nil {
+						return fmt.Errorf("missing schema ref %q", item.GetReference().GetXRef())
+					}
+					if err := visit(target.GetSchema()); err != nil {
+						return err
+					}
 					continue
 				}
-				target := g.refs.schemas[name]
-				if target == nil {
-					return fmt.Errorf("missing schema ref %q", item.GetReference().GetXRef())
-				}
-				if err := visit(target.GetSchema()); err != nil {
+				if err := visit(item.GetSchema()); err != nil {
 					return err
 				}
-				continue
 			}
-			if err := visit(item.GetSchema()); err != nil {
-				return err
-			}
+			return nil
+		}
+		if err := visitItems(current.GetAllOf()); err != nil {
+			return err
+		}
+		if err := visitItems(current.GetAnyOf()); err != nil {
+			return err
+		}
+		if err := visitItems(current.GetOneOf()); err != nil {
+			return err
 		}
 		return nil
 	}

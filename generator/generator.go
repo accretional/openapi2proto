@@ -78,6 +78,7 @@ type messageDef struct {
 
 type fieldDef struct {
 	Name     string
+	OrigName string // original OpenAPI param name (used as HTTP query key); empty means use Name
 	Type     string
 	MapValue string
 	Repeated bool
@@ -246,7 +247,18 @@ func (g *generator) generateComponents() error {
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if _, err := g.ensureNamedSchemaMessage(name, g.refs.schemas[name]); err != nil {
+		schemaRef := g.refs.schemas[name]
+		// Pure scalar schemas are inlined as primitive types wherever they are
+		// referenced; no wrapper message is needed or emitted for them.
+		if schema := schemaRef.GetSchema(); schema != nil && isPureScalarSchema(schema) {
+			continue
+		}
+		// Freeform object schemas are inlined as google.protobuf.Struct wherever
+		// referenced; no wrapper message is needed.
+		if schema := schemaRef.GetSchema(); schema != nil && isFreeformObject(schema) {
+			continue
+		}
+		if _, err := g.ensureNamedSchemaMessage(name, schemaRef); err != nil {
 			return err
 		}
 	}
@@ -405,8 +417,14 @@ func (g *generator) buildRequestMessage(name string, op operationInfo) (*message
 		if err != nil {
 			return nil, nil, "", err
 		}
+		origName := param.GetName()
+		storedOrig := ""
+		if origName != fieldName {
+			storedOrig = origName
+		}
 		msg.Fields = append(msg.Fields, &fieldDef{
 			Name:     fieldName,
+			OrigName: storedOrig,
 			Type:     pt.Type,
 			MapValue: pt.MapValue,
 			Repeated: pt.Repeated,
@@ -773,12 +791,19 @@ func (g *generator) protoTypeForSchema(nameHint string, schemaRef *openapiv3.Sch
 		if kind != "schemas" {
 			return protoType{}, fmt.Errorf("unsupported schema ref %q", ref.GetXRef())
 		}
-		// If the referenced schema is a bare array wrapper, inline it as repeated
-		// instead of generating a named wrapper message.
+		// If the referenced schema is a pure scalar, bare array, or freeform object,
+		// inline it directly instead of generating a named wrapper message.
 		// Guard against recursive schemas (e.g. a schema whose items reference itself).
 		if !g.processingSchema[name] {
 			if refSchemaRef := g.refs.schemas[name]; refSchemaRef != nil {
 				if refSchema := refSchemaRef.GetSchema(); refSchema != nil {
+					if isPureScalarSchema(refSchema) {
+						return scalarProtoType(refSchema.GetType(), refSchema.GetFormat()), nil
+					}
+					if isFreeformObject(refSchema) {
+						g.imports["google/protobuf/struct.proto"] = true
+						return protoType{Type: "google.protobuf.Struct"}, nil
+					}
 					if (refSchema.GetType() == "array" || refSchema.GetItems() != nil) &&
 						!isObjectSchema(refSchema) && !isMapSchema(refSchema) {
 						g.processingSchema[name] = true
@@ -816,6 +841,10 @@ func (g *generator) protoTypeForInlineSchema(nameHint string, schema *openapiv3.
 		if err == nil && valueType != "" {
 			return protoType{Type: "map", MapValue: valueType}, nil
 		}
+	}
+	if isFreeformObject(schema) {
+		g.imports["google/protobuf/struct.proto"] = true
+		return protoType{Type: "google.protobuf.Struct"}, nil
 	}
 	if isObjectSchema(schema) {
 		name := unique(toCamel(nameHint), g.messageNames)
@@ -897,6 +926,46 @@ func isObjectSchema(schema *openapiv3.Schema) bool {
 	return len(schema.GetAllOf()) > 0 ||
 		len(schema.GetAnyOf()) > 0 ||
 		len(schema.GetOneOf()) > 0
+}
+
+// isPureScalarSchema reports whether a schema resolves to a single primitive
+// value (string, number, integer, boolean) with no object properties, no array
+// items, and no composition keywords that introduce properties. Such schemas
+// are inlined directly as proto primitive types rather than wrapped in a
+// one-field message.
+//
+// anyOf/oneOf/allOf are permitted as long as every inline sub-schema (no $ref)
+// is itself a pure scalar — this handles patterns like TTL which is defined as
+// anyOf [{number, min:30, max:86400}, {number, enum:[1]}].
+func isPureScalarSchema(schema *openapiv3.Schema) bool {
+	if schema == nil {
+		return false
+	}
+	if schema.GetType() == "object" {
+		return false
+	}
+	if schema.GetProperties() != nil && len(schema.GetProperties().GetAdditionalProperties()) > 0 {
+		return false
+	}
+	if isMapSchema(schema) {
+		return false
+	}
+	if schema.GetType() == "array" || schema.GetItems() != nil {
+		return false
+	}
+	// For composition keywords, every inline sub-schema must also be a pure
+	// scalar. A $ref sub-schema cannot be inspected without the ref resolver
+	// here, so treat it conservatively as non-scalar.
+	combined := append(append(schema.GetAllOf(), schema.GetAnyOf()...), schema.GetOneOf()...)
+	for _, item := range combined {
+		if item.GetReference() != nil {
+			return false
+		}
+		if s := item.GetSchema(); s != nil && !isPureScalarSchema(s) {
+			return false
+		}
+	}
+	return true
 }
 
 func isFreeformObject(schema *openapiv3.Schema) bool {

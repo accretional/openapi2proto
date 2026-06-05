@@ -270,6 +270,19 @@ func coerceStringFields(data []byte, md protoreflect.MessageDescriptor) []byte {
 				}
 			}
 
+		case fd.Kind() == protoreflect.MessageKind && !fd.IsList() && first != '{' && first != '[' && first != 'n':
+			// Scalar JSON value for a message-typed field. If the message is a
+			// wrapper type (single "value" field), wrap the scalar automatically.
+			// This handles oneOf/anyOf schemas that collapse to a scalar but
+			// still generate a wrapper message (e.g. DnsRecordsTtl).
+			if fd.Message().Fields().ByName("value") != nil {
+				wrapped, err := json.Marshal(map[string]json.RawMessage{"value": v})
+				if err == nil {
+					raw[k] = wrapped
+					changed = true
+				}
+			}
+
 		case fd.Kind() == protoreflect.MessageKind && !fd.IsList() && first == '{':
 			if coerced := coerceStringFields(v, fd.Message()); !bytes.Equal(coerced, []byte(v)) {
 				raw[k] = coerced

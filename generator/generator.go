@@ -1170,11 +1170,18 @@ func (g *generator) collectProperties(schema *openapiv3.Schema) ([]*openapiv3.Na
 	order := make([]string, 0)
 	var additional *openapiv3.AdditionalPropertiesItem
 
+	// visited guards against cyclic composition (e.g. schema A whose allOf
+	// references schema B whose allOf references A, as in the Redocly and
+	// Portbase specs). Without it, the recursive descent through $ref members
+	// overflows the stack. Schemas are deduplicated by pointer identity.
+	visited := make(map[*openapiv3.Schema]bool)
+
 	var visit func(*openapiv3.Schema) error
 	visit = func(current *openapiv3.Schema) error {
-		if current == nil {
+		if current == nil || visited[current] {
 			return nil
 		}
+		visited[current] = true
 		if current.GetProperties() != nil {
 			for _, prop := range current.GetProperties().GetAdditionalProperties() {
 				if _, ok := props[prop.GetName()]; !ok {

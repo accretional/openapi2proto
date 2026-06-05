@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 var (
@@ -116,11 +117,43 @@ func uniqueField(base string, seen map[string]int) string {
 	if base == "" {
 		base = "field"
 	}
-	if n := seen[base]; n == 0 {
-		seen[base] = 1
-		return base
+	// Protobuf forbids two fields in a message from sharing a JSON name. protoc
+	// derives the JSON name by lower-camel-casing the field name, so distinct
+	// snake_case names like "companion_clicks_1" and "companion_clicks1" both
+	// map to "companionClicks1" and collide (e.g. the AdButler spec). Track the
+	// derived JSON name (prefixed with "json:" to share the seen map) and append
+	// a numeric suffix until both the field name and its JSON name are unique.
+	candidate := base
+	for {
+		jsonKey := "json:" + protoJSONName(candidate)
+		if seen[candidate] == 0 && seen[jsonKey] == 0 {
+			seen[candidate] = 1
+			seen[jsonKey] = 1
+			return candidate
+		}
+		n := seen[base] + 1
+		seen[base] = n
+		candidate = base + "_" + strconv.Itoa(n)
 	}
-	n := seen[base] + 1
-	seen[base] = n
-	return base + "_" + strconv.Itoa(n)
+}
+
+// protoJSONName replicates protoc's default JSON name derivation: the
+// underscore-delimited field name is lower-camel-cased (each part after the
+// first is capitalized, underscores removed).
+func protoJSONName(name string) string {
+	var b strings.Builder
+	upperNext := false
+	for _, r := range name {
+		if r == '_' {
+			upperNext = true
+			continue
+		}
+		if upperNext {
+			b.WriteRune(unicode.ToUpper(r))
+			upperNext = false
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }

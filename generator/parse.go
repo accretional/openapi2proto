@@ -25,6 +25,15 @@ import (
 // The spec is parsed into a yaml.Node tree so key order (and therefore
 // generated proto field numbering) is preserved across sanitization.
 func DecodeOpenAPIFromBytes(data []byte) (*openapiv3.Document, error) {
+	// A common malformation in otherwise-JSON specs is a trailing comma before a
+	// closing "}"/"]" (e.g. automotive-iq), which both JSON and yaml.v3 reject.
+	// Strip such commas first so the document can then flow through the
+	// valid-JSON cleanup path below. The transformation is a no-op on
+	// well-formed input.
+	if !json.Valid(data) {
+		data = stripTrailingCommas(data)
+	}
+
 	// yaml.v3 (used for order-preserving parsing) rejects the surrogate-pair
 	// \uXXXX escapes that JSON specs use for astral-plane characters (e.g.
 	// emoji). Decode those to UTF-8 first when the input is JSON.
@@ -37,6 +46,12 @@ func DecodeOpenAPIFromBytes(data []byte) (*openapiv3.Document, error) {
 		// for the schema, so strip them. JSON syntax outside strings never
 		// contains such bytes, so this is safe to apply to the whole document.
 		data = stripJSONControlChars(data)
+		// yaml.v3 rejects the JSON-only escaped solidus "\/", which several
+		// specs use inside string values (e.g. carapi, openapi-schemas, emburse
+		// date/URL fields). In valid JSON the two-byte sequence backslash-slash
+		// only ever appears as this escape and always denotes "/", so it is safe
+		// to unescape it document-wide before YAML parsing.
+		data = unescapeJSONSolidus(data)
 	}
 
 	var root yaml.Node
@@ -50,6 +65,10 @@ func DecodeOpenAPIFromBytes(data []byte) (*openapiv3.Document, error) {
 		// Some v2 specs (e.g. Slack) use a non-standard array form for
 		// "items"; kin-openapi rejects it. Normalize before conversion.
 		sanitizeSwaggerV2(documentRoot(&root))
+		// Repair operation/path-item shapes the v2->v3 converter rejects
+		// outright (multiple body params, path-item-level body/schema params)
+		// and stub internal $refs that point at missing definitions.
+		sanitizeSwaggerV2Doc(documentRoot(&root))
 		v3JSON, err := convertSwaggerV2ToV3(&root)
 		if err != nil {
 			return nil, fmt.Errorf("converting OpenAPI 2.0 to v3: %w", err)
@@ -124,17 +143,19 @@ func decodeJSONSurrogates(data []byte) []byte {
 
 // stripJSONControlChars removes disallowed control characters from a JSON
 // document so the order-preserving YAML parser can read it. It drops C0
-// controls (U+0000-U+001F) except tab/newline/CR and the entire C1 control
-// block (U+0080-U+009F). These appear only inside JSON string values; JSON
-// structural syntax never uses them, so removing them cannot corrupt the
-// document structure.
+// controls (U+0000-U+001F) except tab/newline/CR, the entire C1 control block
+// (U+0080-U+009F), and the Unicode noncharacters yaml.v3 also rejects (U+FFFE,
+// U+FFFF, and the U+FDD0-U+FDEF block — these appear, e.g., as the upper bound
+// of a regex character range in the Emburse spec). These appear only inside
+// JSON string values; JSON structural syntax never uses them, so removing them
+// cannot corrupt the document structure.
 func stripJSONControlChars(data []byte) []byte {
 	// Fast path: bail out unless a disallowed byte is present. C1 controls are
-	// encoded in UTF-8 as 0xC2 0x80-0x9F, so check for both the C0 bytes and a
-	// leading 0xC2.
+	// encoded in UTF-8 as 0xC2 0x80-0x9F; the noncharacters start with 0xEF
+	// (U+FDD0-U+FDEF and U+FFFE/U+FFFF all begin with the byte 0xEF in UTF-8).
 	needsWork := false
 	for _, b := range data {
-		if (b < 0x20 && b != '\t' && b != '\n' && b != '\r') || b == 0xC2 {
+		if (b < 0x20 && b != '\t' && b != '\n' && b != '\r') || b == 0xC2 || b == 0xEF {
 			needsWork = true
 			break
 		}
@@ -146,14 +167,99 @@ func stripJSONControlChars(data []byte) []byte {
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
-		// Drop C0 controls (except tab/newline/CR) and the C1 control block.
+		// Drop C0 controls (except tab/newline/CR), the C1 control block, and
+		// the Unicode noncharacters yaml.v3 forbids.
 		if (r < 0x20 && r != '\t' && r != '\n' && r != '\r') ||
-			(r >= 0x80 && r <= 0x9F) {
+			(r >= 0x80 && r <= 0x9F) ||
+			r == 0xFFFE || r == 0xFFFF ||
+			(r >= 0xFDD0 && r <= 0xFDEF) {
 			continue
 		}
 		b.WriteRune(r)
 	}
 	return []byte(b.String())
+}
+
+// unescapeJSONSolidus rewrites the JSON escape sequence "\/" (backslash-solidus)
+// to "/" so yaml.v3 — which treats backslash-solidus as an unknown escape and
+// aborts — can parse the document. It walks the bytes tracking backslash runs so
+// that an escaped backslash followed by a slash (e.g. the "\\/" inside a regex
+// pattern, which means backslash+slash, not an escaped solidus) is left intact.
+// Only a "\/" preceded by an even number of backslashes is the JSON solidus
+// escape and is collapsed to "/".
+func unescapeJSONSolidus(data []byte) []byte {
+	if !strings.Contains(string(data), `\/`) {
+		return data
+	}
+	out := make([]byte, 0, len(data))
+	backslashes := 0
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if c == '\\' {
+			backslashes++
+			out = append(out, c)
+			continue
+		}
+		if c == '/' && backslashes%2 == 1 {
+			// Preceding backslash is an escape introducer for this solidus:
+			// drop it and keep just the slash.
+			out = out[:len(out)-1]
+			out = append(out, '/')
+			backslashes = 0
+			continue
+		}
+		backslashes = 0
+		out = append(out, c)
+	}
+	return out
+}
+
+// stripTrailingCommas removes commas that immediately precede a closing "}" or
+// "]" (ignoring intervening whitespace). Such trailing commas are invalid in
+// both JSON and YAML flow collections but appear in some hand-edited specs
+// (e.g. automotive-iq). The scan tracks string context so commas inside string
+// values are never touched.
+func stripTrailingCommas(data []byte) []byte {
+	s := string(data)
+	if !strings.Contains(s, ",") {
+		return data
+	}
+	out := make([]byte, 0, len(s))
+	inStr := false
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			out = append(out, c)
+			if c == '\\' && i+1 < len(s) { // copy escaped char verbatim
+				i++
+				out = append(out, s[i])
+				continue
+			}
+			if c == quote {
+				inStr = false
+			}
+			continue
+		}
+		if c == '"' || c == '\'' {
+			inStr = true
+			quote = c
+			out = append(out, c)
+			continue
+		}
+		if c == ',' {
+			// Look ahead past whitespace for a closing bracket.
+			j := i + 1
+			for j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r') {
+				j++
+			}
+			if j < len(s) && (s[j] == '}' || s[j] == ']') {
+				continue // drop the trailing comma
+			}
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 func parseHex4(s string) (uint16, bool) {

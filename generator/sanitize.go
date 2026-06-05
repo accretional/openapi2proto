@@ -1,6 +1,7 @@
 package generator
 
 import (
+	"strconv"
 	"strings"
 
 	yaml "go.yaml.in/yaml/v3"
@@ -48,6 +49,17 @@ func sanitizeForGnostic(root *yaml.Node) {
 	// Strip non-standard keys from path items and operations (e.g. the stray
 	// "request" key in the Meilisearch spec) so gnostic can ingest them.
 	if paths := mapValue(doc, "paths"); paths != nil && paths.Kind == yaml.MappingNode {
+		// Drop stray non-path keys (those not starting with "/" and not x-
+		// extensions) that gnostic rejects as invalid Paths Object properties
+		// (e.g. WhizzoPay places a duplicate "openapi" key inside "paths").
+		kept := paths.Content[:0]
+		for i := 0; i+1 < len(paths.Content); i += 2 {
+			k := paths.Content[i].Value
+			if strings.HasPrefix(k, "/") || isExtension(k) {
+				kept = append(kept, paths.Content[i], paths.Content[i+1])
+			}
+		}
+		paths.Content = kept
 		for i := 1; i < len(paths.Content); i += 2 {
 			sanitizePathItem(paths.Content[i])
 		}
@@ -65,29 +77,149 @@ func sanitizeForGnostic(root *yaml.Node) {
 	// whose per-operation externalDocs carry only a description).
 	dropInvalidExternalDocs(doc)
 
-	// Tag Objects require a scalar string "description". Some specs (e.g.
-	// DigitalOcean's bundled output) leave an unresolved external $ref map there;
-	// drop any non-scalar description so gnostic can ingest the tags array.
+	// Tag Objects require a scalar string "description" and gnostic's strict 3.0
+	// model rejects any other key (e.g. the stray "summary" key in the GeoAPI
+	// spec). Drop a non-scalar description and strip unknown tag keys.
 	if tags := mapValue(doc, "tags"); tags != nil && tags.Kind == yaml.SequenceNode {
 		for _, tag := range tags.Content {
 			if d := mapValue(tag, "description"); d != nil && d.Kind != yaml.ScalarNode {
 				deleteKey(tag, "description")
 			}
+			stripUnknownKeys(tag, tagAllowed)
 		}
 	}
 
-	// Clean the info object (3.0 fields + x- extensions only).
+	// Clean the info object (3.0 fields + x- extensions only) and repair the
+	// required "title"/"version" properties that several real-world specs omit
+	// or mistype, which gnostic's strict 3.0 model rejects.
 	if info := mapValue(doc, "info"); info != nil && info.Kind == yaml.MappingNode {
 		stripUnknownKeys(info, infoAllowed)
 		if lic := mapValue(info, "license"); lic != nil && lic.Kind == yaml.MappingNode {
 			stripUnknownKeys(lic, licenseAllowed)
+			// license.name is required by gnostic's 3.0 model; some specs (e.g.
+			// MeldRx) supply only a "url". Inject a placeholder name so the
+			// document still validates rather than failing the whole conversion.
+			if !hasKey(lic, "name") {
+				setKey(lic, "name", scalarStr(""))
+			}
 		}
 		if contact := mapValue(info, "contact"); contact != nil && contact.Kind == yaml.MappingNode {
 			stripUnknownKeys(contact, contactAllowed)
 		}
+		// info.title and info.version are required. Inject placeholders when
+		// absent (e.g. Happy Returns, propio-ls omit version) and coerce a
+		// non-string version (e.g. prh's YAML float 1.0) to a string, since
+		// gnostic rejects a numeric version value.
+		if !hasKey(info, "title") {
+			setKey(info, "title", scalarStr(""))
+		}
+		if v := mapValue(info, "version"); v == nil {
+			setKey(info, "version", scalarStr("0.0.0"))
+		} else if v.Kind == yaml.ScalarNode {
+			v.Tag = "!!str"
+		}
+	} else {
+		// gnostic requires an Info Object with title+version; inject a minimal
+		// one when the document omits "info" entirely.
+		setKey(doc, "info", &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
+			scalarStr("title"), scalarStr(""),
+			scalarStr("version"), scalarStr("0.0.0"),
+		}})
+	}
+
+	// Sanitize reusable components (responses, headers, parameters, security
+	// schemes) the same way as their inline counterparts so gnostic accepts them.
+	if comp := mapValue(doc, "components"); comp != nil && comp.Kind == yaml.MappingNode {
+		sanitizeComponents(comp)
 	}
 
 	walkSchemas(doc)
+}
+
+// scalarStr builds a string scalar node.
+func scalarStr(s string) *yaml.Node {
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: s}
+}
+
+// sanitizeComponents repairs the reusable Component Objects gnostic validates
+// strictly. Misplaced or non-standard component entries are normalized rather
+// than dropped where possible (partial-conversion policy).
+func sanitizeComponents(comp *yaml.Node) {
+	// components.responses entries are Response Objects: ensure required
+	// "description" and lift any 2.0-style "schema" into content.
+	if resps := mapValue(comp, "responses"); resps != nil && resps.Kind == yaml.MappingNode {
+		for i := 1; i < len(resps.Content); i += 2 {
+			normalizeResponseObject(resps.Content[i])
+		}
+	}
+	// components.headers entries are Header Objects. Some specs (e.g. NZXplorer)
+	// store a *map of named headers* under a single component header instead of
+	// a Header Object; gnostic rejects the header names as unknown keys. Strip
+	// any key that isn't a valid Header Object key so the (now possibly empty)
+	// header still validates.
+	if hdrs := mapValue(comp, "headers"); hdrs != nil && hdrs.Kind == yaml.MappingNode {
+		for i := 1; i < len(hdrs.Content); i += 2 {
+			h := hdrs.Content[i]
+			if h.Kind == yaml.MappingNode && !hasKey(h, "$ref") {
+				normalizeParamLikeSchema(h)
+				stripUnknownKeys(h, headerAllowed)
+			}
+		}
+	}
+	// components.parameters entries are Parameter Objects.
+	if params := mapValue(comp, "parameters"); params != nil && params.Kind == yaml.MappingNode {
+		for i := 1; i < len(params.Content); i += 2 {
+			normalizeParameter(params.Content[i])
+		}
+	}
+	// components.securitySchemes entries are Security Scheme Objects, which
+	// gnostic requires to carry a valid "type" (apiKey/http/oauth2/
+	// openIdConnect). Repair common mistakes: canonicalize the type case (e.g.
+	// JuniperSecurity's "APIKey" -> "apiKey") and drop schemes with no usable
+	// type (e.g. FleetHD's empty "Bearer: {}"), which would otherwise fail the
+	// whole document.
+	if sec := mapValue(comp, "securitySchemes"); sec != nil && sec.Kind == yaml.MappingNode {
+		kept := sec.Content[:0]
+		for i := 0; i+1 < len(sec.Content); i += 2 {
+			scheme := sec.Content[i+1]
+			if scheme.Kind == yaml.MappingNode && !hasKey(scheme, "$ref") {
+				if t := mapValue(scheme, "type"); t != nil && t.Kind == yaml.ScalarNode {
+					if canon, ok := securitySchemeTypes[strings.ToLower(t.Value)]; ok {
+						t.Value = canon
+					}
+				}
+				// Drop a scheme whose type isn't a recognized 3.0 value.
+				t := mapValue(scheme, "type")
+				if t == nil || t.Kind != yaml.ScalarNode || !validSecuritySchemeType[t.Value] {
+					continue
+				}
+			}
+			kept = append(kept, sec.Content[i], sec.Content[i+1])
+		}
+		sec.Content = kept
+	}
+	// components.schemas entries are Schema Objects by definition. Some specs
+	// (e.g. carbon-transparency) misplace a Response Object here, leaving a
+	// non-schema "content" sibling that gnostic rejects as an invalid schema.
+	// Strip any key that isn't a 3.0 Schema Object keyword (preserving $ref and
+	// x- extensions); a now-empty schema renders downstream as a freeform
+	// google.protobuf.Struct, matching the existing $ref-fallback behavior.
+	if schemas := mapValue(comp, "schemas"); schemas != nil && schemas.Kind == yaml.MappingNode {
+		for i := 1; i < len(schemas.Content); i += 2 {
+			s := schemas.Content[i]
+			if s.Kind != yaml.MappingNode || hasKey(s, "$ref") {
+				continue
+			}
+			out := s.Content[:0]
+			for j := 0; j+1 < len(s.Content); j += 2 {
+				k := s.Content[j].Value
+				if schemaKeywords[k] || isExtension(k) {
+					out = append(out, s.Content[j], s.Content[j+1])
+				}
+			}
+			s.Content = out
+		}
+	}
 }
 
 // dropInvalidExternalDocs recursively removes any "externalDocs" object that is
@@ -162,6 +294,46 @@ var mediaTypeAllowed = map[string]bool{
 	"schema": true, "example": true, "examples": true, "encoding": true,
 }
 
+// parameterAllowed is the set of OpenAPI 3.0 Parameter Object keys gnostic
+// accepts. Non-standard siblings (e.g. AdButler's "parameter") are stripped.
+var parameterAllowed = map[string]bool{
+	"name": true, "in": true, "description": true, "required": true,
+	"deprecated": true, "allowEmptyValue": true, "style": true, "explode": true,
+	"allowReserved": true, "schema": true, "example": true, "examples": true,
+	"content": true,
+}
+
+// responseAllowed is the set of OpenAPI 3.0 Response Object keys gnostic
+// accepts.
+var responseAllowed = map[string]bool{
+	"description": true, "headers": true, "content": true, "links": true,
+}
+
+// headerAllowed is the set of OpenAPI 3.0 Header Object keys gnostic accepts.
+var headerAllowed = map[string]bool{
+	"description": true, "required": true, "deprecated": true,
+	"allowEmptyValue": true, "style": true, "explode": true,
+	"allowReserved": true, "schema": true, "example": true, "examples": true,
+	"content": true,
+}
+
+// tagAllowed is the set of OpenAPI 3.0 Tag Object keys gnostic accepts.
+var tagAllowed = map[string]bool{
+	"name": true, "description": true, "externalDocs": true,
+}
+
+// securitySchemeTypes maps a lowercased Security Scheme "type" to its canonical
+// OpenAPI 3.0 spelling so miscased values (e.g. "APIKey") are accepted.
+var securitySchemeTypes = map[string]string{
+	"apikey": "apiKey", "http": "http", "oauth2": "oauth2",
+	"openidconnect": "openIdConnect",
+}
+
+// validSecuritySchemeType is the set of canonical 3.0 Security Scheme types.
+var validSecuritySchemeType = map[string]bool{
+	"apiKey": true, "http": true, "oauth2": true, "openIdConnect": true,
+}
+
 // normalizeMediaType fixes Media Type Objects whose schema keywords were placed
 // directly on the media type (instead of under "schema"). It moves any stray
 // schema-defining keywords into a nested "schema" object and drops other
@@ -199,6 +371,12 @@ func sanitizePathItem(item *yaml.Node) {
 		return
 	}
 	stripUnknownKeys(item, pathItemAllowed)
+	// Path-item-level parameters apply to every operation.
+	if params := mapValue(item, "parameters"); params != nil && params.Kind == yaml.SequenceNode {
+		for _, p := range params.Content {
+			normalizeParameter(p)
+		}
+	}
 	for _, verb := range operationVerbs {
 		op := mapValue(item, verb)
 		if op == nil || op.Kind != yaml.MappingNode {
@@ -211,10 +389,113 @@ func sanitizePathItem(item *yaml.Node) {
 			continue
 		}
 		stripUnknownKeys(op, operationAllowed)
+		// gnostic's Request Body Object requires a "content" property. Some specs
+		// (e.g. AdButler) attach an empty requestBody ({}); drop a requestBody
+		// that is neither a $ref nor has content so the operation validates.
+		if rb := mapValue(op, "requestBody"); rb != nil && rb.Kind == yaml.MappingNode &&
+			!hasKey(rb, "content") && !hasKey(rb, "$ref") {
+			deleteKey(op, "requestBody")
+		}
+		if params := mapValue(op, "parameters"); params != nil && params.Kind == yaml.SequenceNode {
+			for _, p := range params.Content {
+				normalizeParameter(p)
+			}
+		}
 		if resp := mapValue(op, "responses"); resp != nil {
 			normalizeResponses(resp)
+			// Each Response Object value (after key canonicalization) must carry a
+			// "description" and use the 3.0 content form.
+			for j := 1; j < len(resp.Content); j += 2 {
+				normalizeResponseObject(resp.Content[j])
+			}
+		} else {
+			// gnostic requires every Operation Object to have a "responses"
+			// property. Some specs (e.g. HuggingFace, geokon) omit it; inject an
+			// empty Responses Object so the operation validates.
+			setKey(op, "responses", &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"})
 		}
 	}
+}
+
+// normalizeParameter repairs a single Parameter Object so gnostic's strict 3.0
+// model accepts it. Non-standard sibling keys (e.g. AdButler's "parameter")
+// are stripped; schema-defining keywords placed directly on the parameter
+// (the OpenAPI 2.0 idiom, e.g. "type"/"format"/"nullable" in civicplus,
+// eaglealpha, unified) are lifted into a nested "schema" object.
+func normalizeParameter(p *yaml.Node) {
+	if p == nil || p.Kind != yaml.MappingNode || hasKey(p, "$ref") {
+		return
+	}
+	normalizeParamLikeSchema(p)
+	stripUnknownKeys(p, parameterAllowed)
+	// gnostic requires a scalar "description"; some specs (e.g.
+	// globalforestwatch) supply an array. Drop a non-scalar description.
+	if d := mapValue(p, "description"); d != nil && d.Kind != yaml.ScalarNode {
+		deleteKey(p, "description")
+	}
+	// gnostic requires "name" and "in" on every Parameter Object. Some specs
+	// (e.g. aviowiki, ChannelAdvisor) omit "in"; default it to "query" so the
+	// parameter still validates. A missing "name" is similarly defaulted.
+	if !hasKey(p, "in") {
+		setKey(p, "in", scalarStr("query"))
+	}
+	if !hasKey(p, "name") {
+		setKey(p, "name", scalarStr("param"))
+	}
+}
+
+// normalizeParamLikeSchema lifts any schema-defining keyword found directly on a
+// Parameter or Header Object into a nested "schema" object (OpenAPI 2.0 placed
+// them inline). Existing "schema" objects are left untouched.
+func normalizeParamLikeSchema(p *yaml.Node) {
+	if hasKey(p, "schema") {
+		return
+	}
+	var schemaContent []*yaml.Node
+	keep := p.Content[:0]
+	for i := 0; i+1 < len(p.Content); i += 2 {
+		k := p.Content[i].Value
+		// "collectionFormat" is a 2.0-only keyword with no 3.0 schema equivalent;
+		// drop it rather than carry it into the schema.
+		if k == "collectionFormat" {
+			continue
+		}
+		if schemaKeywords[k] && k != "$ref" && k != "description" {
+			schemaContent = append(schemaContent, p.Content[i], p.Content[i+1])
+			continue
+		}
+		keep = append(keep, p.Content[i], p.Content[i+1])
+	}
+	p.Content = keep
+	if len(schemaContent) > 0 {
+		setKey(p, "schema", &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: schemaContent})
+	}
+}
+
+// normalizeResponseObject repairs a single Response Object: it injects the
+// required "description" when absent (e.g. arep, estes-express, pointofrental)
+// and lifts a 2.0-style top-level "schema" into the 3.0 content form (e.g.
+// hyperhuman, innovation, junipersecurity).
+func normalizeResponseObject(r *yaml.Node) {
+	if r == nil || r.Kind != yaml.MappingNode || hasKey(r, "$ref") {
+		return
+	}
+	// 2.0-style response: a "schema" sibling instead of "content". Wrap it in an
+	// application/json media type so gnostic's 3.0 Response Object accepts it.
+	if sch := mapValue(r, "schema"); sch != nil && !hasKey(r, "content") {
+		deleteKey(r, "schema")
+		mt := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
+			scalarStr("schema"), sch,
+		}}
+		content := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
+			scalarStr("application/json"), mt,
+		}}
+		setKey(r, "content", content)
+	}
+	if !hasKey(r, "description") {
+		setKey(r, "description", scalarStr(""))
+	}
+	stripUnknownKeys(r, responseAllowed)
 }
 
 // responseRangeKeys maps non-standard response range keys to the OpenAPI 3.0
@@ -394,11 +675,25 @@ var schemaKeywords = map[string]bool{
 // example/default/enum/examples are left untouched so user data is never
 // mangled, while "properties" values are always treated as schemas regardless
 // of their key names.
-func walkSchemas(n *yaml.Node) {
+func walkSchemas(n *yaml.Node) { walkSchemasNode(n, false) }
+
+// walkSchemasNode is the worker for walkSchemas. The "forced" flag is set when
+// the current mapping occupies a position that is *always* a Schema Object
+// (a value under "properties", "items", "additionalProperties", a member of
+// "allOf"/"anyOf"/"oneOf", or "not"). In those positions non-standard sibling
+// keywords are stripped unconditionally — without the looksLikeSchema guard —
+// because malformed specs frequently put a 2.0-style "schema"/"example" pair or
+// a 3.1 "examples"/"$id"/"$schema" keyword on a schema that carries no other
+// schema-defining marker (e.g. jambase's validFrom, pointofrental's $id blocks).
+func walkSchemasNode(n *yaml.Node, forced bool) {
 	switch n.Kind {
 	case yaml.MappingNode:
 		downconvertSchema(n)
-		stripUnknownSchemaKeywords(n)
+		if forced {
+			stripSchemaKeywordsForced(n)
+		} else {
+			stripUnknownSchemaKeywords(n)
+		}
 		for i := 0; i+1 < len(n.Content); i += 2 {
 			key := n.Content[i].Value
 			val := n.Content[i+1]
@@ -406,10 +701,22 @@ func walkSchemas(n *yaml.Node) {
 			case "properties":
 				if val.Kind == yaml.MappingNode {
 					for j := 1; j < len(val.Content); j += 2 {
-						walkSchemas(val.Content[j])
+						walkSchemasNode(val.Content[j], true)
 					}
 				} else {
-					walkSchemas(val)
+					walkSchemasNode(val, false)
+				}
+			case "items", "additionalProperties", "not":
+				// Always-schema positions (additionalProperties may also be a
+				// bool, which walkSchemasNode ignores for scalars).
+				walkSchemasNode(val, true)
+			case "allOf", "anyOf", "oneOf":
+				if val.Kind == yaml.SequenceNode {
+					for _, m := range val.Content {
+						walkSchemasNode(m, true)
+					}
+				} else {
+					walkSchemasNode(val, false)
 				}
 			case "example", "default", "enum", "examples":
 				// Raw user data — do not apply schema rewrites.
@@ -426,17 +733,24 @@ func walkSchemas(n *yaml.Node) {
 				// schema keywords into a proper "schema" subobject, then recurse.
 				if val.Kind == yaml.MappingNode {
 					for j := 1; j < len(val.Content); j += 2 {
-						normalizeMediaType(val.Content[j])
+						mt := val.Content[j]
+						normalizeMediaType(mt)
+						// Strip keys that don't belong on a Media Type Object
+						// (e.g. BillionVerify places a Response-level "headers"
+						// map on the media type), which gnostic rejects.
+						if mt != nil && mt.Kind == yaml.MappingNode {
+							stripUnknownKeys(mt, mediaTypeAllowed)
+						}
 					}
 				}
-				walkSchemas(val)
+				walkSchemasNode(val, false)
 			default:
-				walkSchemas(val)
+				walkSchemasNode(val, false)
 			}
 		}
 	case yaml.SequenceNode, yaml.DocumentNode:
 		for _, c := range n.Content {
-			walkSchemas(c)
+			walkSchemasNode(c, false)
 		}
 	}
 }
@@ -447,6 +761,15 @@ func walkSchemas(n *yaml.Node) {
 // always preserved.
 func stripUnknownSchemaKeywords(m *yaml.Node) {
 	if !looksLikeSchema(m) {
+		return
+	}
+	stripSchemaKeywordsForced(m)
+}
+
+// stripSchemaKeywordsForced removes every key that is not a 3.0 Schema Object
+// keyword (or x- extension or $ref) from a mapping known to be a schema.
+func stripSchemaKeywordsForced(m *yaml.Node) {
+	if m == nil || m.Kind != yaml.MappingNode {
 		return
 	}
 	out := m.Content[:0]
@@ -542,6 +865,31 @@ func downconvertSchema(m *yaml.Node) {
 		setKey(m, "enum", seq)
 	}
 
+	// gnostic requires a scalar string "description"; some specs (e.g.
+	// carbonmapper) supply an array. Drop a non-scalar description so the schema
+	// validates.
+	if d := mapValue(m, "description"); d != nil && d.Kind != yaml.ScalarNode {
+		deleteKey(m, "description")
+	}
+	// Likewise "title" must be a scalar string.
+	if t := mapValue(m, "title"); t != nil && t.Kind != yaml.ScalarNode {
+		deleteKey(m, "title")
+	}
+
+	// gnostic requires numeric-valued constraints to be YAML numbers; some specs
+	// (e.g. jikan-rest's "score") quote them as strings ("5"), which gnostic
+	// rejects. Coerce a quoted numeric scalar to a number, or drop it if it
+	// isn't a valid number.
+	normalizeNumericKeyword(m, "maximum")
+	normalizeNumericKeyword(m, "minimum")
+	normalizeNumericKeyword(m, "multipleOf")
+	normalizeNumericKeyword(m, "maxLength")
+	normalizeNumericKeyword(m, "minLength")
+	normalizeNumericKeyword(m, "maxItems")
+	normalizeNumericKeyword(m, "minItems")
+	normalizeNumericKeyword(m, "maxProperties")
+	normalizeNumericKeyword(m, "minProperties")
+
 	// Numeric exclusiveMinimum/Maximum -> 3.0 boolean form.
 	convertExclusiveBound(m, "exclusiveMinimum", "minimum")
 	convertExclusiveBound(m, "exclusiveMaximum", "maximum")
@@ -620,6 +968,31 @@ func isNullSchema(m *yaml.Node) bool {
 	return false
 }
 
+// normalizeNumericKeyword coerces a string-quoted numeric schema constraint to
+// a YAML number so gnostic accepts it. A value that is not a valid number is
+// dropped (partial-conversion policy). Already-numeric values are left as-is.
+func normalizeNumericKeyword(m *yaml.Node, key string) {
+	v := mapValue(m, key)
+	if v == nil || v.Kind != yaml.ScalarNode {
+		return
+	}
+	if v.Tag == "!!int" || v.Tag == "!!float" {
+		return
+	}
+	if _, err := strconv.ParseFloat(v.Value, 64); err == nil {
+		if strings.ContainsAny(v.Value, ".eE") {
+			v.Tag = "!!float"
+		} else {
+			v.Tag = "!!int"
+		}
+		// Clear any quoting style carried over from JSON parsing so the value
+		// marshals as a bare number rather than a quoted string.
+		v.Style = 0
+		return
+	}
+	deleteKey(m, key)
+}
+
 // convertExclusiveBound translates a numeric exclusive bound (JSON Schema
 // 2020-12 / OpenAPI 3.1) into the OpenAPI 3.0 form: a numeric minimum/maximum
 // plus the boolean exclusiveMinimum/exclusiveMaximum flag.
@@ -674,6 +1047,142 @@ func sanitizeSwaggerV2(n *yaml.Node) {
 	case yaml.SequenceNode, yaml.DocumentNode:
 		for _, c := range n.Content {
 			sanitizeSwaggerV2(c)
+		}
+	}
+}
+
+// sanitizeSwaggerV2Doc repairs OpenAPI 2.0 document-level shapes that
+// kin-openapi's openapi2conv.ToV3 rejects with a hard error. It operates on the
+// document root mapping.
+//
+// Transformations (partial-conversion policy — each drops/merges minimally):
+//   - Operation parameters: at most one "in: body" parameter is kept (the
+//     first); extras are dropped. ToV3 aborts on "multiple body parameters"
+//     (brla, burlingtonnc, daconoco, norfolk).
+//   - Path-item-level parameters: any "in: body" or schema-bearing parameter is
+//     dropped. ToV3 aborts with "pathItem must not have a body/schema
+//     parameter" (fitbit, netlify-com, opto22-com-groov).
+//   - Internal $refs that resolve to nothing (the target definition/response/
+//     parameter is absent) are replaced with an empty schema, which downstream
+//     renders as google.protobuf.Struct (rexsoftinc references a missing
+//     #/definitions/form).
+func sanitizeSwaggerV2Doc(doc *yaml.Node) {
+	if doc == nil || doc.Kind != yaml.MappingNode {
+		return
+	}
+	stubMissingV2Refs(doc)
+	paths := mapValue(doc, "paths")
+	if paths == nil || paths.Kind != yaml.MappingNode {
+		return
+	}
+	// Drop path entries whose key is an HTTP verb (e.g. Fitbit's "post" path):
+	// these are operations mis-promoted to the Paths Object and would otherwise
+	// surface their parameters as illegal path-item-level body/schema params.
+	keptPaths := paths.Content[:0]
+	for i := 0; i+1 < len(paths.Content); i += 2 {
+		if verbSet[paths.Content[i].Value] {
+			continue
+		}
+		keptPaths = append(keptPaths, paths.Content[i], paths.Content[i+1])
+	}
+	paths.Content = keptPaths
+	for i := 1; i < len(paths.Content); i += 2 {
+		item := paths.Content[i]
+		if item.Kind != yaml.MappingNode {
+			continue
+		}
+		// Path-item-level parameters must not be body or schema parameters in
+		// the 2.0->3.0 conversion.
+		if pp := mapValue(item, "parameters"); pp != nil && pp.Kind == yaml.SequenceNode {
+			pp.Content = filterV2PathParams(pp.Content)
+		}
+		for _, verb := range operationVerbs {
+			op := mapValue(item, verb)
+			if op == nil || op.Kind != yaml.MappingNode {
+				continue
+			}
+			if params := mapValue(op, "parameters"); params != nil && params.Kind == yaml.SequenceNode {
+				params.Content = dedupeV2BodyParams(params.Content)
+			}
+		}
+	}
+}
+
+// verbSet is the set of HTTP operation verb names.
+var verbSet = map[string]bool{
+	"get": true, "put": true, "post": true, "delete": true,
+	"options": true, "head": true, "patch": true, "trace": true,
+}
+
+// filterV2PathParams drops parameters that the v2->v3 converter forbids at the
+// path-item level: body parameters, schema-bearing parameters, and the 2.0
+// "formData"/typed parameters that ToV3 treats as schema parameters.
+func filterV2PathParams(params []*yaml.Node) []*yaml.Node {
+	out := params[:0]
+	for _, p := range params {
+		if p.Kind == yaml.MappingNode {
+			if in := mapValue(p, "in"); in != nil && (in.Value == "body" || in.Value == "formData") {
+				continue
+			}
+			if hasKey(p, "schema") {
+				continue
+			}
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// dedupeV2BodyParams keeps at most the first "in: body" parameter in an
+// operation's parameter list and drops any subsequent ones.
+func dedupeV2BodyParams(params []*yaml.Node) []*yaml.Node {
+	out := params[:0]
+	seenBody := false
+	for _, p := range params {
+		if p.Kind == yaml.MappingNode {
+			if in := mapValue(p, "in"); in != nil && in.Value == "body" {
+				if seenBody {
+					continue
+				}
+				seenBody = true
+			}
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// stubMissingV2Refs replaces internal $refs whose target component is absent
+// from the document with an empty schema. ToV3 fails to resolve such dangling
+// refs and aborts the whole conversion; stubbing them yields a partial
+// conversion instead.
+func stubMissingV2Refs(doc *yaml.Node) {
+	// Build the set of present internal targets under the 2.0 component sections.
+	present := map[string]bool{}
+	for _, section := range []string{"definitions", "responses", "parameters"} {
+		if sec := mapValue(doc, section); sec != nil && sec.Kind == yaml.MappingNode {
+			for j := 0; j+1 < len(sec.Content); j += 2 {
+				present["#/"+section+"/"+sec.Content[j].Value] = true
+			}
+		}
+	}
+	stubMissingV2RefsWalk(doc, present)
+}
+
+func stubMissingV2RefsWalk(n *yaml.Node, present map[string]bool) {
+	switch n.Kind {
+	case yaml.MappingNode:
+		if ref := mapValue(n, "$ref"); ref != nil && ref.Kind == yaml.ScalarNode &&
+			strings.HasPrefix(ref.Value, "#/") && !present[ref.Value] {
+			// Dangling internal ref: drop it so the node becomes an empty schema.
+			deleteKey(n, "$ref")
+		}
+		for i := 1; i < len(n.Content); i += 2 {
+			stubMissingV2RefsWalk(n.Content[i], present)
+		}
+	case yaml.SequenceNode, yaml.DocumentNode:
+		for _, c := range n.Content {
+			stubMissingV2RefsWalk(c, present)
 		}
 	}
 }

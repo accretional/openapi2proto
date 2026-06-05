@@ -38,6 +38,30 @@ func sanitizeForGnostic(root *yaml.Node) {
 		v.Tag = "!!str"
 	}
 
+	// Strip OpenAPI 3.1-only / non-standard top-level root keys that gnostic's
+	// strict 3.0 model rejects (e.g. "webhooks", "jsonSchemaDialect"). x-
+	// extensions are preserved.
+	stripUnknownKeys(doc, rootAllowed)
+
+	// Strip non-standard keys from path items and operations (e.g. the stray
+	// "request" key in the Meilisearch spec) so gnostic can ingest them.
+	if paths := mapValue(doc, "paths"); paths != nil && paths.Kind == yaml.MappingNode {
+		for i := 1; i < len(paths.Content); i += 2 {
+			sanitizePathItem(paths.Content[i])
+		}
+	}
+
+	// Tag Objects require a scalar string "description". Some specs (e.g.
+	// DigitalOcean's bundled output) leave an unresolved external $ref map there;
+	// drop any non-scalar description so gnostic can ingest the tags array.
+	if tags := mapValue(doc, "tags"); tags != nil && tags.Kind == yaml.SequenceNode {
+		for _, tag := range tags.Content {
+			if d := mapValue(tag, "description"); d != nil && d.Kind != yaml.ScalarNode {
+				deleteKey(tag, "description")
+			}
+		}
+	}
+
 	// Clean the info object (3.0 fields + x- extensions only).
 	if info := mapValue(doc, "info"); info != nil && info.Kind == yaml.MappingNode {
 		stripUnknownKeys(info, infoAllowed)
@@ -66,6 +90,96 @@ func documentRoot(n *yaml.Node) *yaml.Node {
 var infoAllowed = map[string]bool{
 	"title": true, "description": true, "termsOfService": true,
 	"contact": true, "license": true, "version": true, "summary": true,
+}
+
+// rootAllowed is the set of OpenAPI 3.0 root document keys gnostic accepts.
+// Top-level 3.1 additions like "webhooks" and "jsonSchemaDialect" are stripped.
+var rootAllowed = map[string]bool{
+	"openapi": true, "info": true, "servers": true, "paths": true,
+	"components": true, "security": true, "tags": true, "externalDocs": true,
+}
+
+// pathItemAllowed is the set of OpenAPI 3.0 Path Item keys. Operation verbs are
+// included; non-standard siblings (e.g. Meilisearch's stray "request") are
+// stripped so the path item validates.
+var pathItemAllowed = map[string]bool{
+	"$ref": true, "summary": true, "description": true, "servers": true,
+	"parameters": true, "get": true, "put": true, "post": true, "delete": true,
+	"options": true, "head": true, "patch": true, "trace": true,
+}
+
+// operationAllowed is the set of OpenAPI 3.0 Operation keys.
+var operationAllowed = map[string]bool{
+	"tags": true, "summary": true, "description": true, "externalDocs": true,
+	"operationId": true, "parameters": true, "requestBody": true,
+	"responses": true, "callbacks": true, "deprecated": true, "security": true,
+	"servers": true,
+}
+
+var operationVerbs = []string{"get", "put", "post", "delete", "options", "head", "patch", "trace"}
+
+// mediaTypeAllowed is the set of OpenAPI 3.0 Media Type Object keys.
+var mediaTypeAllowed = map[string]bool{
+	"schema": true, "example": true, "examples": true, "encoding": true,
+}
+
+// normalizeMediaType fixes Media Type Objects whose schema keywords were placed
+// directly on the media type (instead of under "schema"). It moves any stray
+// schema-defining keywords into a nested "schema" object and drops other
+// non-media-type siblings, so gnostic can ingest the response/request body.
+func normalizeMediaType(mt *yaml.Node) {
+	if mt == nil || mt.Kind != yaml.MappingNode || hasKey(mt, "schema") {
+		return
+	}
+	if !looksLikeSchema(mt) {
+		return
+	}
+	var schemaContent []*yaml.Node
+	keep := mt.Content[:0]
+	for i := 0; i+1 < len(mt.Content); i += 2 {
+		k := mt.Content[i].Value
+		if mediaTypeAllowed[k] || isExtension(k) {
+			keep = append(keep, mt.Content[i], mt.Content[i+1])
+			continue
+		}
+		schemaContent = append(schemaContent, mt.Content[i], mt.Content[i+1])
+	}
+	mt.Content = keep
+	if len(schemaContent) > 0 {
+		setKey(mt, "schema", &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: schemaContent})
+	}
+}
+
+// sanitizePathItem strips non-standard sibling keys from a Path Item Object and
+// from each Operation Object it contains. A path item whose only verb body is a
+// bare $ref to an external file (OpenAPI 3.0 forbids $ref siblings on path
+// items, and gnostic cannot resolve external operation refs) has that
+// unresolvable verb dropped so the rest of the document still parses.
+func sanitizePathItem(item *yaml.Node) {
+	if item == nil || item.Kind != yaml.MappingNode {
+		return
+	}
+	stripUnknownKeys(item, pathItemAllowed)
+	for _, verb := range operationVerbs {
+		op := mapValue(item, verb)
+		if op == nil || op.Kind != yaml.MappingNode {
+			continue
+		}
+		// An operation whose body is an external/unresolvable $ref (no inline
+		// responses) cannot be ingested by gnostic; drop it.
+		if hasKey(op, "$ref") && !hasKey(op, "responses") {
+			deleteKey(item, verb)
+			continue
+		}
+		stripUnknownKeys(op, operationAllowed)
+	}
+}
+
+// validScalarTypes is the set of OpenAPI 3.0 Schema Object "type" values.
+// Any other scalar type (e.g. "any") is non-standard and dropped.
+var validScalarTypes = map[string]bool{
+	"string": true, "number": true, "integer": true,
+	"boolean": true, "array": true, "object": true, "null": true,
 }
 
 var licenseAllowed = map[string]bool{"name": true, "url": true}
@@ -194,6 +308,23 @@ func walkSchemas(n *yaml.Node) {
 				}
 			case "example", "default", "enum", "examples":
 				// Raw user data — do not apply schema rewrites.
+			case "securitySchemes":
+				// Security Scheme Objects carry a "type" key (http/apiKey/oauth2/
+				// openIdConnect) that would otherwise make them look like schemas
+				// and get their non-schema keywords (scheme, flows, name, ...)
+				// stripped. Skip them entirely.
+			case "content":
+				// "content" maps media-type strings to Media Type Objects. Some
+				// specs place schema keywords (type/properties/...) directly on
+				// the media type instead of nesting them under "schema" (e.g.
+				// Meilisearch's text/plain "/metrics" response). Lift such stray
+				// schema keywords into a proper "schema" subobject, then recurse.
+				if val.Kind == yaml.MappingNode {
+					for j := 1; j < len(val.Content); j += 2 {
+						normalizeMediaType(val.Content[j])
+					}
+				}
+				walkSchemas(val)
 			default:
 				walkSchemas(val)
 			}
@@ -226,7 +357,19 @@ func stripUnknownSchemaKeywords(m *yaml.Node) {
 // looksLikeSchema reports whether m carries a schema-defining keyword that
 // distinguishes it from arbitrary objects such as path items or media types.
 func looksLikeSchema(m *yaml.Node) bool {
-	for _, k := range []string{"type", "properties", "items", "allOf", "anyOf", "oneOf", "enum", "format", "nullable"} {
+	// A "type" key only signals a schema when its value is an actual schema type
+	// (string/number/integer/boolean/array/object/null, possibly as a 3.1 type
+	// array). A "type" of http/apiKey/oauth2/... denotes a Security Scheme, not a
+	// schema, and must not be treated as one.
+	if t := mapValue(m, "type"); t != nil {
+		if t.Kind == yaml.SequenceNode {
+			return true
+		}
+		if t.Kind == yaml.ScalarNode && validScalarTypes[t.Value] {
+			return true
+		}
+	}
+	for _, k := range []string{"properties", "items", "allOf", "anyOf", "oneOf", "enum", "format", "nullable"} {
 		if hasKey(m, k) {
 			return true
 		}
@@ -242,6 +385,14 @@ func downconvertSchema(m *yaml.Node) {
 	collapseNullableUnion(m, "anyOf")
 	collapseNullableUnion(m, "oneOf")
 
+	// A boolean "required" inside a schema is a JSON-Schema draft-3 / non-standard
+	// idiom (e.g. Meilisearch, Zendesk). OpenAPI 3.0 requires "required" to be an
+	// array of property names at the object level; a boolean here is invalid, so
+	// drop it. (Genuine object-level required arrays are left untouched.)
+	if r := mapValue(m, "required"); r != nil && r.Kind == yaml.ScalarNode && r.Tag == "!!bool" {
+		deleteKey(m, "required")
+	}
+
 	// type handling.
 	if t := mapValue(m, "type"); t != nil {
 		switch t.Kind {
@@ -249,6 +400,11 @@ func downconvertSchema(m *yaml.Node) {
 			if t.Value == "null" {
 				deleteKey(m, "type")
 				setKey(m, "nullable", boolNode(true))
+			} else if !validScalarTypes[t.Value] {
+				// Non-standard / JSON-Schema scalar types gnostic's 3.0 model
+				// rejects (e.g. "any" in Meilisearch). Drop the type so the
+				// schema is treated as freeform (google.protobuf.Struct).
+				deleteKey(m, "type")
 			}
 		case yaml.SequenceNode:
 			var nonNull []*yaml.Node

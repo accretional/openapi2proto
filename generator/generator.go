@@ -396,6 +396,21 @@ func lastPackageSegment(pkg string) string {
 	return parts[len(parts)-1]
 }
 
+// schemalessBodyType returns the proto type used for a request/response body
+// whose media type declares no schema. When HTTP annotations are emitted the
+// consuming project already imports googleapis, so google.api.HttpBody (which
+// carries the raw payload + content type) is used. Otherwise googleapis may not
+// be on the protoc include path, so the always-available well-known type
+// google.protobuf.Struct is used instead to keep the output self-contained.
+func (g *generator) schemalessBodyType() protoType {
+	if g.cfg.EmitHTTPAnnotations {
+		g.imports["google/api/httpbody.proto"] = true
+		return protoType{Type: "google.api.HttpBody"}
+	}
+	g.imports["google/protobuf/struct.proto"] = true
+	return protoType{Type: "google.protobuf.Struct"}
+}
+
 func (g *generator) buildRequestMessage(name string, op operationInfo) (*messageDef, map[string]string, string, error) {
 	msg := &messageDef{Name: name, Comment: firstNonEmpty(op.Op.GetSummary(), op.Op.GetDescription())}
 	pathFields := make(map[string]string)
@@ -457,8 +472,7 @@ func (g *generator) buildRequestMessage(name string, op operationInfo) (*message
 				return nil, nil, "", err
 			}
 		} else {
-			g.imports["google/api/httpbody.proto"] = true
-			pt = protoType{Type: "google.api.HttpBody"}
+			pt = g.schemalessBodyType()
 		}
 		msg.Fields = append(msg.Fields, &fieldDef{
 			Name:     fieldName,
@@ -503,8 +517,7 @@ func (g *generator) buildResponseMessage(name string, op operationInfo) (*messag
 				return nil, "", err
 			}
 		} else {
-			g.imports["google/api/httpbody.proto"] = true
-			pt = protoType{Type: "google.api.HttpBody"}
+			pt = g.schemalessBodyType()
 		}
 		msg.Fields = append(msg.Fields, &fieldDef{
 			Name:     "body",
@@ -589,15 +602,13 @@ func (g *generator) resolveParameter(paramRef *openapiv3.ParameterOrReference) (
 		return nil, nil
 	}
 	kind, name, err := parseRef(ref.GetXRef())
-	if err != nil {
-		return nil, err
-	}
-	if kind != "parameters" {
-		return nil, fmt.Errorf("unsupported parameter ref %q", ref.GetXRef())
+	// Unresolvable parameter refs are skipped (return nil) rather than fatal.
+	if err != nil || kind != "parameters" {
+		return nil, nil
 	}
 	target := g.refs.parameters[name]
 	if target == nil {
-		return nil, fmt.Errorf("missing parameter ref %q", ref.GetXRef())
+		return nil, nil
 	}
 	return target.GetParameter(), nil
 }
@@ -614,15 +625,13 @@ func (g *generator) resolveRequestBody(bodyRef *openapiv3.RequestBodyOrReference
 		return nil, nil
 	}
 	kind, name, err := parseRef(ref.GetXRef())
-	if err != nil {
-		return nil, err
-	}
-	if kind != "requestBodies" {
-		return nil, fmt.Errorf("unsupported request body ref %q", ref.GetXRef())
+	// Unresolvable request-body refs are skipped (return nil) rather than fatal.
+	if err != nil || kind != "requestBodies" {
+		return nil, nil
 	}
 	target := g.refs.requestBodies[name]
 	if target == nil {
-		return nil, fmt.Errorf("missing request body ref %q", ref.GetXRef())
+		return nil, nil
 	}
 	return target.GetRequestBody(), nil
 }
@@ -693,15 +702,13 @@ func (g *generator) resolveResponse(respRef *openapiv3.ResponseOrReference) (*op
 		return nil, nil
 	}
 	kind, name, err := parseRef(ref.GetXRef())
-	if err != nil {
-		return nil, err
-	}
-	if kind != "responses" {
-		return nil, fmt.Errorf("unsupported response ref %q", ref.GetXRef())
+	// Unresolvable response refs are skipped (return nil) rather than fatal.
+	if err != nil || kind != "responses" {
+		return nil, nil
 	}
 	target := g.refs.responses[name]
 	if target == nil {
-		return nil, fmt.Errorf("missing response ref %q", ref.GetXRef())
+		return nil, nil
 	}
 	return target.GetResponse(), nil
 }
@@ -718,15 +725,13 @@ func (g *generator) resolveHeader(headerRef *openapiv3.HeaderOrReference) (*open
 		return nil, nil
 	}
 	kind, name, err := parseRef(ref.GetXRef())
-	if err != nil {
-		return nil, err
-	}
-	if kind != "headers" {
-		return nil, fmt.Errorf("unsupported header ref %q", ref.GetXRef())
+	// Unresolvable header refs are skipped (return nil) rather than fatal.
+	if err != nil || kind != "headers" {
+		return nil, nil
 	}
 	target := g.refs.headers[name]
 	if target == nil {
-		return nil, fmt.Errorf("missing header ref %q", ref.GetXRef())
+		return nil, nil
 	}
 	return target.GetHeader(), nil
 }
@@ -792,11 +797,16 @@ func (g *generator) protoTypeForSchema(nameHint string, schemaRef *openapiv3.Sch
 	}
 	if ref := schemaRef.GetReference(); ref != nil {
 		kind, name, err := parseRef(ref.GetXRef())
-		if err != nil {
-			return protoType{}, err
-		}
-		if kind != "schemas" {
-			return protoType{}, fmt.Errorf("unsupported schema ref %q", ref.GetXRef())
+		// A schema $ref that is not a resolvable internal component schema
+		// reference (e.g. an external-file ref like "common.yml#/Foo", a deep
+		// JSON pointer like "#/components/schemas/Tag/allOf/0", or a ref that
+		// points at the wrong component kind such as "#/components/responses/X")
+		// cannot be represented as a named message. Per the partial-conversion
+		// policy, fall back to google.protobuf.Struct so the rest of the service
+		// still converts.
+		if err != nil || kind != "schemas" || g.refs.schemas[name] == nil {
+			g.imports["google/protobuf/struct.proto"] = true
+			return protoType{Type: "google.protobuf.Struct"}, nil
 		}
 		// If the referenced schema is a pure scalar, bare array, or freeform object,
 		// inline it directly instead of generating a named wrapper message.
@@ -824,7 +834,13 @@ func (g *generator) protoTypeForSchema(nameHint string, schemaRef *openapiv3.Sch
 						if _, err2 := g.ensureNamedSchemaMessage(name, refSchemaRef); err2 != nil {
 							return protoType{}, err2
 						}
-						return protoType{Type: itemType.Type, Repeated: true}, nil
+						// "repeated map<...>" and "repeated repeated" are not
+						// expressible in proto3. When the array element is itself a
+						// map or another array, fall through to the named-message
+						// path, which wraps each element in a single-field message.
+						if itemType.MapValue == "" && !itemType.Repeated {
+							return protoType{Type: itemType.Type, Repeated: true}, nil
+						}
 					}
 				}
 			}
@@ -879,10 +895,20 @@ func (g *generator) protoTypeForInlineSchema(nameHint string, schema *openapiv3.
 		if err != nil {
 			return protoType{}, err
 		}
-		if itemType.MapValue != "" {
+		if itemType.MapValue != "" || itemType.Repeated {
+			// proto3 cannot express repeated map or repeated repeated; wrap each
+			// element in a single-field message.
 			wrapperName := unique(toCamel(nameHint)+"Item", g.messageNames)
-			msg := &messageDef{Name: wrapperName, Comment: "Wrapper for array entries that cannot be expressed directly as repeated map fields."}
-			msg.Fields = append(msg.Fields, &fieldDef{Name: "entry", Type: "map", MapValue: itemType.MapValue, Number: 1})
+			msg := &messageDef{Name: wrapperName, Comment: "Wrapper for nested array/map entries that cannot be expressed directly as a repeated field."}
+			entry := &fieldDef{Name: "entry", Number: 1}
+			if itemType.MapValue != "" {
+				entry.Type = "map"
+				entry.MapValue = itemType.MapValue
+			} else {
+				entry.Type = itemType.Type
+				entry.Repeated = true
+			}
+			msg.Fields = append(msg.Fields, entry)
 			g.addMessage(msg)
 			return protoType{Type: wrapperName, Repeated: true}, nil
 		}
@@ -1098,10 +1124,20 @@ func (g *generator) fillMessageFromSchema(msg *messageDef, schema *openapiv3.Sch
 		if err != nil {
 			return err
 		}
-		if pt.MapValue != "" {
+		if pt.MapValue != "" || pt.Repeated {
+			// proto3 cannot express repeated map or repeated repeated; wrap each
+			// element in a single-field message.
 			wrapperName := unique(msg.Name+"Item", g.messageNames)
-			wrapper := &messageDef{Name: wrapperName, Comment: "Wrapper for map array entries."}
-			wrapper.Fields = append(wrapper.Fields, &fieldDef{Name: "entry", Type: "map", MapValue: pt.MapValue, Number: 1})
+			wrapper := &messageDef{Name: wrapperName, Comment: "Wrapper for nested array/map entries."}
+			entry := &fieldDef{Name: "entry", Number: 1}
+			if pt.MapValue != "" {
+				entry.Type = "map"
+				entry.MapValue = pt.MapValue
+			} else {
+				entry.Type = pt.Type
+				entry.Repeated = true
+			}
+			wrapper.Fields = append(wrapper.Fields, entry)
 			g.addMessage(wrapper)
 			pt = protoType{Type: wrapperName}
 		}
@@ -1154,15 +1190,16 @@ func (g *generator) collectProperties(schema *openapiv3.Schema) ([]*openapiv3.Na
 			for _, item := range items {
 				if item.GetReference() != nil {
 					kind, name, err := parseRef(item.GetReference().GetXRef())
-					if err != nil {
-						return err
-					}
-					if kind != "schemas" {
+					// Unresolvable / non-schema composition members (external
+					// refs, deep JSON pointers, wrong component kind) are skipped
+					// rather than treated as fatal; the remaining members still
+					// contribute their properties.
+					if err != nil || kind != "schemas" {
 						continue
 					}
 					target := g.refs.schemas[name]
 					if target == nil {
-						return fmt.Errorf("missing schema ref %q", item.GetReference().GetXRef())
+						continue
 					}
 					if err := visit(target.GetSchema()); err != nil {
 						return err

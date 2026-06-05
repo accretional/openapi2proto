@@ -25,18 +25,19 @@ type Config struct {
 }
 
 type generator struct {
-	cfg            Config
-	sourceName     string
-	doc            *openapiv3.Document
-	refs           *refResolver
-	imports        map[string]bool
-	services       map[string]*serviceDef
-	serviceOrder   []string
-	serviceNames   map[string]int
-	messageNames   map[string]int
-	componentNames map[string]string
-	messages       map[string]*messageDef
-	messageOrder   []string
+	cfg              Config
+	sourceName       string
+	doc              *openapiv3.Document
+	refs             *refResolver
+	imports          map[string]bool
+	services         map[string]*serviceDef
+	serviceOrder     []string
+	serviceNames     map[string]int
+	messageNames     map[string]int
+	componentNames   map[string]string
+	messages         map[string]*messageDef
+	messageOrder     []string
+	processingSchema map[string]bool // recursion guard for protoTypeForSchema
 }
 
 type refResolver struct {
@@ -105,23 +106,26 @@ type resolvedResponse struct {
 // GenerateGoService produces a Go source file implementing gRPC handlers that
 // bridge to the REST API described in doc. goModule is the module path of the
 // consuming project; pbSubPath is the relative import path where protoc places
-// the generated pb files (e.g. "pb/cloudflare/zones").
-func GenerateGoService(sourceName string, doc *openapiv3.Document, cfg Config, goModule, pbSubPath string) ([]byte, error) {
+// the generated pb files (e.g. "pb/cloudflare/zones"); runtimeImport is the
+// Go import path for the runtime package (defaults to
+// "github.com/accretional/openapi2proto/runtime" if empty).
+func GenerateGoService(sourceName string, doc *openapiv3.Document, cfg Config, goModule, pbSubPath, runtimeImport string) ([]byte, error) {
 	if doc == nil {
 		return nil, fmt.Errorf("nil OpenAPI document")
 	}
 	cfg = withDefaults(sourceName, cfg)
 	g := &generator{
-		cfg:            cfg,
-		sourceName:     sourceName,
-		doc:            doc,
-		refs:           newRefResolver(doc),
-		imports:        make(map[string]bool),
-		services:       make(map[string]*serviceDef),
-		serviceNames:   make(map[string]int),
-		messageNames:   make(map[string]int),
-		componentNames: make(map[string]string),
-		messages:       make(map[string]*messageDef),
+		cfg:              cfg,
+		sourceName:       sourceName,
+		doc:              doc,
+		refs:             newRefResolver(doc),
+		imports:          make(map[string]bool),
+		services:         make(map[string]*serviceDef),
+		serviceNames:     make(map[string]int),
+		messageNames:     make(map[string]int),
+		componentNames:   make(map[string]string),
+		messages:         make(map[string]*messageDef),
+		processingSchema: make(map[string]bool),
 	}
 	g.generateUniqueComponentNames()
 	if err := g.generateComponents(); err != nil {
@@ -130,7 +134,10 @@ func GenerateGoService(sourceName string, doc *openapiv3.Document, cfg Config, g
 	if err := g.generateOperations(); err != nil {
 		return nil, err
 	}
-	return g.renderGoService(goModule, pbSubPath), nil
+	if runtimeImport == "" {
+		runtimeImport = "github.com/accretional/openapi2proto/runtime"
+	}
+	return g.renderGoService(goModule, pbSubPath, runtimeImport), nil
 }
 
 func Generate(sourceName string, doc *openapiv3.Document, cfg Config) ([]byte, error) {
@@ -141,14 +148,15 @@ func Generate(sourceName string, doc *openapiv3.Document, cfg Config) ([]byte, e
 	g := &generator{
 		cfg:            cfg,
 		sourceName:     sourceName,
-		doc:            doc,
-		refs:           newRefResolver(doc),
-		imports:        make(map[string]bool),
-		services:       make(map[string]*serviceDef),
-		serviceNames:   make(map[string]int),
-		messageNames:   make(map[string]int),
-		componentNames: make(map[string]string),
-		messages:       make(map[string]*messageDef),
+		doc:              doc,
+		refs:             newRefResolver(doc),
+		imports:          make(map[string]bool),
+		services:         make(map[string]*serviceDef),
+		serviceNames:     make(map[string]int),
+		messageNames:     make(map[string]int),
+		componentNames:   make(map[string]string),
+		messages:         make(map[string]*messageDef),
+		processingSchema: make(map[string]bool),
 	}
 	g.generateUniqueComponentNames()
 	if err := g.generateComponents(); err != nil {
@@ -767,20 +775,25 @@ func (g *generator) protoTypeForSchema(nameHint string, schemaRef *openapiv3.Sch
 		}
 		// If the referenced schema is a bare array wrapper, inline it as repeated
 		// instead of generating a named wrapper message.
-		if refSchemaRef := g.refs.schemas[name]; refSchemaRef != nil {
-			if refSchema := refSchemaRef.GetSchema(); refSchema != nil {
-				if (refSchema.GetType() == "array" || refSchema.GetItems() != nil) &&
-					!isObjectSchema(refSchema) && !isMapSchema(refSchema) {
-					item := firstItem(refSchema)
-					itemType, err := g.protoTypeForSchema(nameHint+"Item", item)
-					if err != nil {
-						return protoType{}, err
+		// Guard against recursive schemas (e.g. a schema whose items reference itself).
+		if !g.processingSchema[name] {
+			if refSchemaRef := g.refs.schemas[name]; refSchemaRef != nil {
+				if refSchema := refSchemaRef.GetSchema(); refSchema != nil {
+					if (refSchema.GetType() == "array" || refSchema.GetItems() != nil) &&
+						!isObjectSchema(refSchema) && !isMapSchema(refSchema) {
+						g.processingSchema[name] = true
+						item := firstItem(refSchema)
+						itemType, err := g.protoTypeForSchema(nameHint+"Item", item)
+						delete(g.processingSchema, name)
+						if err != nil {
+							return protoType{}, err
+						}
+						// Ensure the named message is still registered (for completeness)
+						if _, err2 := g.ensureNamedSchemaMessage(name, refSchemaRef); err2 != nil {
+							return protoType{}, err2
+						}
+						return protoType{Type: itemType.Type, Repeated: true}, nil
 					}
-					// Ensure the named message is still registered (for completeness)
-					if _, err2 := g.ensureNamedSchemaMessage(name, refSchemaRef); err2 != nil {
-						return protoType{}, err2
-					}
-					return protoType{Type: itemType.Type, Repeated: true}, nil
 				}
 			}
 		}

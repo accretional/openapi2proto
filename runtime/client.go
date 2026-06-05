@@ -11,12 +11,14 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Client holds the credentials and transport used for every REST API call.
@@ -98,18 +100,18 @@ func StatusError(data []byte, httpStatus int) error {
 		code = codes.InvalidArgument
 	}
 
-	msg := fmt.Sprintf("http %d", httpStatus)
+	msg := fmt.Sprintf("cloudflare: HTTP %d", httpStatus)
 	if len(env.Errors) > 0 {
-		msg = fmt.Sprintf("%s (code %d)", env.Errors[0].Message, env.Errors[0].Code)
+		msg = fmt.Sprintf("cloudflare: %s (code %d)", env.Errors[0].Message, env.Errors[0].Code)
 	}
 	return status.Error(code, msg)
 }
 
 // Unmarshal deserialises a JSON API response body into a proto message.
-// It strips "errors" and "messages" envelope keys before parsing and
-// silently ignores unknown fields.
+// It strips "errors" and "messages" envelope keys, normalises slash-delimited
+// JSON keys to underscores, coerces freeform JSON objects/arrays into proto
+// string fields, and silently ignores unknown fields.
 func Unmarshal(data []byte, msg proto.Message) error {
-	// Strip envelope keys that aren't part of the proto schema.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err == nil {
 		delete(raw, "errors")
@@ -118,6 +120,8 @@ func Unmarshal(data []byte, msg proto.Message) error {
 			data = cleaned
 		}
 	}
+	data = normalizeSlashKeys(data)
+	data = coerceStringFields(data, msg.ProtoReflect().Descriptor())
 	return protojson.UnmarshalOptions{DiscardUnknown: true}.Unmarshal(data, msg)
 }
 
@@ -128,4 +132,179 @@ func MarshalBody(msg proto.Message) ([]byte, error) {
 		return nil, nil
 	}
 	return protojson.MarshalOptions{UseProtoNames: true}.Marshal(msg)
+}
+
+// MarshalBodyAny marshals any Go value to JSON for use as a request body.
+// Use this for repeated or non-proto-message body fields.
+func MarshalBodyAny(v any) ([]byte, error) {
+	if v == nil {
+		return nil, nil
+	}
+	return json.Marshal(v)
+}
+
+// UnmarshalInto decodes a Cloudflare API response envelope into any Go value.
+// It strips "errors" and "messages" from the top level, extracts the "result"
+// field if present, then uses encoding/json to decode into v.
+func UnmarshalInto(data []byte, v any) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err == nil {
+		delete(raw, "errors")
+		delete(raw, "messages")
+		if result, ok := raw["result"]; ok {
+			return json.Unmarshal(result, v)
+		}
+		if cleaned, err := json.Marshal(raw); err == nil {
+			data = cleaned
+		}
+	}
+	return json.Unmarshal(data, v)
+}
+
+// normalizeSlashKeys recursively rewrites JSON object keys that contain "/"
+// by replacing every "/" with "_". openapi2proto converts slash-delimited
+// annotation keys (e.g. "workers/message") to underscore-separated proto
+// field names ("workers_message"), so protojson won't match the raw key
+// unless we normalise it first.
+func normalizeSlashKeys(data []byte) []byte {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return data
+	}
+	changed := false
+	normalized := make(map[string]json.RawMessage, len(raw))
+	for k, v := range raw {
+		newKey := strings.ReplaceAll(k, "/", "_")
+		if newKey != k {
+			changed = true
+		}
+		if len(v) > 0 && v[0] == '{' {
+			if r := normalizeSlashKeys(v); !bytes.Equal(r, []byte(v)) {
+				v = r
+				changed = true
+			}
+		} else if len(v) > 0 && v[0] == '[' {
+			var elems []json.RawMessage
+			if err := json.Unmarshal(v, &elems); err == nil {
+				anyElem := false
+				for i, elem := range elems {
+					if len(elem) > 0 && elem[0] == '{' {
+						if r := normalizeSlashKeys(elem); !bytes.Equal(r, []byte(elem)) {
+							elems[i] = r
+							anyElem = true
+						}
+					}
+				}
+				if anyElem {
+					if reenc, err := json.Marshal(elems); err == nil {
+						v = reenc
+						changed = true
+					}
+				}
+			}
+		}
+		normalized[newKey] = v
+	}
+	if !changed {
+		return data
+	}
+	result, err := json.Marshal(normalized)
+	if err != nil {
+		return data
+	}
+	return result
+}
+
+// coerceStringFields walks JSON data against the proto message descriptor and
+// converts any JSON object/array value that corresponds to a proto string field
+// into a JSON-encoded string. This handles mismatches where openapi2proto emits
+// 'string' for an OpenAPI field typed as a freeform 'object'.
+func coerceStringFields(data []byte, md protoreflect.MessageDescriptor) []byte {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return data
+	}
+
+	changed := false
+	for k, v := range raw {
+		if len(v) == 0 {
+			continue
+		}
+		first := v[0]
+
+		fd := md.Fields().ByJSONName(k)
+		if fd == nil {
+			fd = md.Fields().ByName(protoreflect.Name(k))
+		}
+		if fd == nil {
+			continue
+		}
+
+		switch {
+		case fd.Kind() == protoreflect.StringKind && !fd.IsList() && (first == '{' || first == '['):
+			s, err := json.Marshal(string(v))
+			if err == nil {
+				raw[k] = s
+				changed = true
+			}
+
+		case fd.Kind() == protoreflect.StringKind && fd.IsList() && first == '[':
+			var elems []json.RawMessage
+			if err := json.Unmarshal(v, &elems); err != nil {
+				continue
+			}
+			elemChanged := false
+			for i, elem := range elems {
+				if len(elem) > 0 && elem[0] != '"' {
+					s, err := json.Marshal(string(elem))
+					if err == nil {
+						elems[i] = s
+						elemChanged = true
+					}
+				}
+			}
+			if elemChanged {
+				if reenc, err := json.Marshal(elems); err == nil {
+					raw[k] = reenc
+					changed = true
+				}
+			}
+
+		case fd.Kind() == protoreflect.MessageKind && !fd.IsList() && first == '{':
+			if coerced := coerceStringFields(v, fd.Message()); !bytes.Equal(coerced, []byte(v)) {
+				raw[k] = coerced
+				changed = true
+			}
+
+		case fd.IsList() && fd.Kind() == protoreflect.MessageKind && first == '[':
+			var elems []json.RawMessage
+			if err := json.Unmarshal(v, &elems); err != nil {
+				continue
+			}
+			elemChanged := false
+			for i, elem := range elems {
+				if len(elem) > 0 && elem[0] == '{' {
+					if coerced := coerceStringFields(elem, fd.Message()); !bytes.Equal(coerced, []byte(elem)) {
+						elems[i] = coerced
+						elemChanged = true
+					}
+				}
+			}
+			if elemChanged {
+				if reenc, err := json.Marshal(elems); err == nil {
+					raw[k] = reenc
+					changed = true
+				}
+			}
+		}
+	}
+
+	if !changed {
+		return data
+	}
+	result, err := json.Marshal(raw)
+	if err != nil {
+		return data
+	}
+	return result
 }

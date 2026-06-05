@@ -70,7 +70,7 @@ func renderService(out *strings.Builder, svc *serviceDef) {
 			continue
 		}
 		out.WriteString(" {\n")
-		out.WriteString("    option (google.api.http) = {\n")
+		out.WriteString("    option (.google.api.http) = {\n")
 		switch method.HTTP.Method {
 		case "GET", "POST", "PUT", "PATCH", "DELETE":
 			out.WriteString(fmt.Sprintf("      %s: %q\n", strings.ToLower(method.HTTP.Method), method.HTTP.Path))

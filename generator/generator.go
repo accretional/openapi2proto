@@ -38,6 +38,11 @@ type generator struct {
 	messages         map[string]*messageDef
 	messageOrder     []string
 	processingSchema map[string]bool // recursion guard for protoTypeForSchema
+	// inlineMessages memoizes the message name generated for a given inline
+	// object schema (keyed by the gnostic schema pointer, which is stable for
+	// the lifetime of a parsed document). Without this, specs that reuse the
+	// same inline object across many properties re-expand it combinatorially.
+	inlineMessages map[*openapiv3.Schema]string
 }
 
 type refResolver struct {
@@ -127,6 +132,7 @@ func GenerateGoService(sourceName string, doc *openapiv3.Document, cfg Config, g
 		componentNames:   make(map[string]string),
 		messages:         make(map[string]*messageDef),
 		processingSchema: make(map[string]bool),
+		inlineMessages:   make(map[*openapiv3.Schema]string),
 	}
 	g.generateUniqueComponentNames()
 	if err := g.generateComponents(); err != nil {
@@ -158,6 +164,7 @@ func Generate(sourceName string, doc *openapiv3.Document, cfg Config) ([]byte, e
 		componentNames:   make(map[string]string),
 		messages:         make(map[string]*messageDef),
 		processingSchema: make(map[string]bool),
+		inlineMessages:   make(map[*openapiv3.Schema]string),
 	}
 	g.generateUniqueComponentNames()
 	if err := g.generateComponents(); err != nil {
@@ -847,7 +854,13 @@ func (g *generator) protoTypeForInlineSchema(nameHint string, schema *openapiv3.
 		return protoType{Type: "google.protobuf.Struct"}, nil
 	}
 	if isObjectSchema(schema) {
+		// Reuse the message already generated for this exact inline schema to
+		// avoid re-expanding shared/recursive inline objects combinatorially.
+		if existing, ok := g.inlineMessages[schema]; ok {
+			return protoType{Type: existing}, nil
+		}
 		name := unique(toCamel(nameHint), g.messageNames)
+		g.inlineMessages[schema] = name
 		msg := &messageDef{Name: name, Comment: firstNonEmpty(schema.GetTitle(), schema.GetDescription())}
 		g.addMessage(msg)
 		if err := g.fillMessageFromSchema(msg, schema); err != nil {

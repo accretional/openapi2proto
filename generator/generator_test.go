@@ -138,3 +138,99 @@ func TestDecodeOpenAPIFromBytesNormalizesJSONSurrogates(t *testing.T) {
 		t.Fatalf("DecodeOpenAPIFromBytes should normalize JSON surrogate escapes: %v", err)
 	}
 }
+
+// TestDecodeOpenAPI31DownConverts exercises the 3.1 -> 3.0 sanitizer: array
+// types with null, anyOf-null unions, const, and stray non-standard keywords.
+func TestDecodeOpenAPI31DownConverts(t *testing.T) {
+	const spec = `
+openapi: 3.1.0
+info:
+  title: V31
+  version: "1.0"
+  license:
+    name: MIT
+    identifier: MIT
+  externalDocs:
+    url: https://example.com
+paths:
+  /items:
+    get:
+      operationId: ListItems
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+            embed: true
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Item'
+components:
+  schemas:
+    Item:
+      type: object
+      properties:
+        id:
+          type: [string, "null"]
+        kind:
+          const: widget
+        parent:
+          anyOf:
+            - $ref: '#/components/schemas/Item'
+            - type: "null"
+`
+	doc, err := DecodeOpenAPIFromBytes([]byte(spec))
+	if err != nil {
+		t.Fatalf("down-conversion failed: %v", err)
+	}
+	out, err := Generate("v31.yaml", doc, Config{})
+	if err != nil {
+		t.Fatalf("generate failed: %v", err)
+	}
+	if !strings.Contains(string(out), "service") {
+		t.Fatalf("expected a service in output:\n%s", out)
+	}
+}
+
+// TestDecodeSwaggerV2UpConverts exercises the OpenAPI 2.0 -> v3 path through
+// kin-openapi, including the non-standard tuple-form items array.
+func TestDecodeSwaggerV2UpConverts(t *testing.T) {
+	const spec = `{
+  "swagger": "2.0",
+  "info": {"title": "V2", "version": "1.0"},
+  "basePath": "/api",
+  "paths": {
+    "/widgets": {
+      "get": {
+        "operationId": "ListWidgets",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "schema": {"$ref": "#/definitions/Widget"}
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "Widget": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "string"},
+        "latest": {"items": [{"$ref": "#/definitions/Widget"}, {"type": "null"}]}
+      }
+    }
+  }
+}`
+	doc, err := DecodeOpenAPIFromBytes([]byte(spec))
+	if err != nil {
+		t.Fatalf("v2 up-conversion failed: %v", err)
+	}
+	if _, err := Generate("v2.json", doc, Config{}); err != nil {
+		t.Fatalf("generate failed: %v", err)
+	}
+}

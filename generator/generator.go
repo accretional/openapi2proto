@@ -16,6 +16,12 @@ type Config struct {
 	ServiceGrouping     string
 	EmitHTTPAnnotations bool
 	HasHTTPPreference   bool
+	// GoModule is the Go module path of the consuming project (e.g.
+	// "github.com/accretional/proto-cloudflare"). Required for service generation.
+	GoModule string
+	// PbSubPath is the import sub-path inside GoModule where protoc writes pb files
+	// (e.g. "pb/cloudflare/zones"). Derived from --go_package if not set.
+	PbSubPath string
 }
 
 type generator struct {
@@ -94,6 +100,37 @@ type operationInfo struct {
 type resolvedResponse struct {
 	Code     string
 	Response *openapiv3.Response
+}
+
+// GenerateGoService produces a Go source file implementing gRPC handlers that
+// bridge to the REST API described in doc. goModule is the module path of the
+// consuming project; pbSubPath is the relative import path where protoc places
+// the generated pb files (e.g. "pb/cloudflare/zones").
+func GenerateGoService(sourceName string, doc *openapiv3.Document, cfg Config, goModule, pbSubPath string) ([]byte, error) {
+	if doc == nil {
+		return nil, fmt.Errorf("nil OpenAPI document")
+	}
+	cfg = withDefaults(sourceName, cfg)
+	g := &generator{
+		cfg:            cfg,
+		sourceName:     sourceName,
+		doc:            doc,
+		refs:           newRefResolver(doc),
+		imports:        make(map[string]bool),
+		services:       make(map[string]*serviceDef),
+		serviceNames:   make(map[string]int),
+		messageNames:   make(map[string]int),
+		componentNames: make(map[string]string),
+		messages:       make(map[string]*messageDef),
+	}
+	g.generateUniqueComponentNames()
+	if err := g.generateComponents(); err != nil {
+		return nil, err
+	}
+	if err := g.generateOperations(); err != nil {
+		return nil, err
+	}
+	return g.renderGoService(goModule, pbSubPath), nil
 }
 
 func Generate(sourceName string, doc *openapiv3.Document, cfg Config) ([]byte, error) {

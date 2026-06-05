@@ -113,7 +113,7 @@ func Generate(sourceName string, doc *openapiv3.Document, cfg Config) ([]byte, e
 		componentNames: make(map[string]string),
 		messages:       make(map[string]*messageDef),
 	}
-	g.reserveComponentNames()
+	g.generateUniqueComponentNames()
 	if err := g.generateComponents(); err != nil {
 		return nil, err
 	}
@@ -183,7 +183,7 @@ func newRefResolver(doc *openapiv3.Document) *refResolver {
 	return r
 }
 
-func (g *generator) reserveComponentNames() {
+func (g *generator) generateUniqueComponentNames() {
 	names := make([]string, 0, len(g.refs.schemas))
 	for name := range g.refs.schemas {
 		names = append(names, name)

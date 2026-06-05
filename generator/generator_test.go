@@ -73,7 +73,7 @@ components:
 `
 
 func TestGenerateSampleSpec(t *testing.T) {
-	doc, err := ParseDocument([]byte(sampleSpec))
+	doc, err := DecodeOpenAPIFromBytes([]byte(sampleSpec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestGenerateTwilioVoiceSpecCompiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	doc, err := ParseDocument(data)
+	doc, err := DecodeOpenAPIFromBytes(data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,9 +132,9 @@ func TestGenerateTwilioVoiceSpecCompiles(t *testing.T) {
 	}
 }
 
-func TestParseDocumentNormalizesJSONSurrogates(t *testing.T) {
+func TestDecodeOpenAPIFromBytesNormalizesJSONSurrogates(t *testing.T) {
 	const raw = `{"openapi":"3.0.1","info":{"title":"Emoji","version":"1.0"},"paths":{},"components":{"schemas":{"demo":{"type":"object","properties":{"body":{"type":"string","example":"Hello! \ud83d\udc4d"}}}}}}`
-	if _, err := ParseDocument([]byte(raw)); err != nil {
-		t.Fatalf("ParseDocument should normalize JSON surrogate escapes: %v", err)
+	if _, err := DecodeOpenAPIFromBytes([]byte(raw)); err != nil {
+		t.Fatalf("DecodeOpenAPIFromBytes should normalize JSON surrogate escapes: %v", err)
 	}
 }

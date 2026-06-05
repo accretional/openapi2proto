@@ -19,7 +19,13 @@
 # 1. Full demo (proto generation + validation + stats)
 ./demo.sh
 
-# 2. With live API testing (requires Twilio credentials)
+# 2. With live API testing
+#    Option A: Create .env file
+echo "TWILIO_ACCOUNT_SID=ACxxx" > .env
+echo "TWILIO_AUTH_TOKEN=xxx" >> .env
+./demo.sh --test
+
+#    Option B: Export directly
 export TWILIO_ACCOUNT_SID=ACxxx
 export TWILIO_AUTH_TOKEN=xxx
 ./demo.sh --test

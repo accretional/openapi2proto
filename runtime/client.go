@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
@@ -26,6 +27,23 @@ type Client struct {
 	token   string
 	baseURL string
 	http    *http.Client
+}
+
+// EscapePath percent-escapes a path-parameter value while preserving "/"
+// separators. Google (and other) REST APIs frequently put resource names like
+// "projects/my-proj/serviceAccounts/x" into a single path position via reserved
+// expansion ({+name} in discovery), where the embedded slashes are literal path
+// separators and must NOT be encoded to %2F. Each slash-delimited segment is
+// escaped individually with url.PathEscape.
+func EscapePath(s string) string {
+	if !strings.Contains(s, "/") {
+		return url.PathEscape(s)
+	}
+	parts := strings.Split(s, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return strings.Join(parts, "/")
 }
 
 // New returns a Client that authenticates with the given bearer token against baseURL.
@@ -123,6 +141,21 @@ func Unmarshal(data []byte, msg proto.Message) error {
 	data = normalizeSlashKeys(data)
 	data = coerceStringFields(data, msg.ProtoReflect().Descriptor())
 	return protojson.UnmarshalOptions{DiscardUnknown: true}.Unmarshal(data, msg)
+}
+
+// UnmarshalStruct decodes a JSON API response into a structpb.Struct, suitable
+// for a response "body" field of type google.protobuf.Struct (the catch-all body
+// type the converter emits when an operation has no typed response schema). An
+// empty body yields an empty, non-nil Struct.
+func UnmarshalStruct(data []byte) (*structpb.Struct, error) {
+	s := &structpb.Struct{}
+	if len(data) == 0 {
+		return s, nil
+	}
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(data, s); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // MarshalBody serialises a proto message to JSON for use as a request body.

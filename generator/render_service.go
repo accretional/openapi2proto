@@ -8,6 +8,36 @@ import (
 
 var pathParamRE = regexp.MustCompile(`\{([^}]+)\}`)
 
+// reservedLocalNames are identifiers that a path-parameter local variable must
+// not shadow: Go keywords (which would be a syntax error, e.g. a param named
+// "type" or "range") plus the fixed identifiers the service template itself
+// declares in the same scope (which would cause redeclaration/shadowing, e.g.
+// a param named "req" or "q"). Any path param whose name collides gets a "_"
+// suffix.
+var reservedLocalNames = map[string]bool{
+	// Go keywords.
+	"break": true, "case": true, "chan": true, "const": true, "continue": true,
+	"default": true, "defer": true, "else": true, "fallthrough": true, "for": true,
+	"func": true, "go": true, "goto": true, "if": true, "import": true,
+	"interface": true, "map": true, "package": true, "range": true, "return": true,
+	"select": true, "struct": true, "switch": true, "type": true, "var": true,
+	// Template-declared identifiers and imported package aliases.
+	"ctx": true, "req": true, "s": true, "q": true, "err": true, "resp": true,
+	"data": true, "httpStatus": true, "bodyBytes": true, "v": true,
+	"neturl": true, "strconv": true, "runtime": true, "context": true,
+	"grpc": true, "pb": true,
+}
+
+// goLocalName returns a Go identifier safe to use as a path-parameter local
+// variable, escaping names that would collide with keywords or the service
+// template's own variables.
+func goLocalName(fieldName string) string {
+	if reservedLocalNames[fieldName] {
+		return fieldName + "_"
+	}
+	return fieldName
+}
+
 // protoNameToGoName applies protoc-gen-go's rule of capitalizing lowercase
 // letters that immediately follow a digit. E.g. "Pfx2as" → "Pfx2As".
 func protoNameToGoName(name string) string {
@@ -61,9 +91,6 @@ func (g *generator) renderGoService(goModule, pbSubPath, runtimeImport string) [
 			if rpc.HTTP == nil {
 				continue
 			}
-			if pathParamRE.MatchString(rpc.HTTP.Path) {
-				needsURL = true
-			}
 			reqMsg := g.messages[rpc.RequestType]
 			if reqMsg != nil {
 				pathSet := pathParamSet(rpc.HTTP.Path)
@@ -81,7 +108,7 @@ func (g *generator) renderGoService(goModule, pbSubPath, runtimeImport string) [
 						} else if f.Type != "string" {
 							needsStrconv = true
 						}
-						needsURL = true
+						// Path params escape via runtime.EscapePath, not net/url.
 						continue
 					}
 					// Query params.
@@ -121,6 +148,17 @@ func (g *generator) renderGoService(goModule, pbSubPath, runtimeImport string) [
 		svc := g.services[svcName]
 		g.renderGoServiceImpl(&out, svc, pkgAlias, needsURL, needsStrconv)
 	}
+
+	// RegisterAll wires every service in this package onto a gRPC server,
+	// giving entrypoints a uniform hook regardless of how many services the
+	// spec produced.
+	out.WriteString("// RegisterAll registers every service in this package on srv using client.\n")
+	out.WriteString("func RegisterAll(srv *grpc.Server, client *runtime.Client) {\n")
+	for _, svcName := range g.serviceOrder {
+		goSvcName := protoNameToGoName(g.services[svcName].Name)
+		out.WriteString(fmt.Sprintf("\tNew%sServer(client).Register(srv)\n", goSvcName))
+	}
+	out.WriteString("}\n")
 
 	return []byte(out.String())
 }
@@ -192,6 +230,7 @@ func (g *generator) renderGoMethod(out *strings.Builder, svc *serviceDef, rpc *r
 			continue
 		}
 		declared[fieldName] = true
+		varName := goLocalName(fieldName)
 		getter := protoNameToGoName("Get" + toCamel(fieldName))
 		fd := findField(reqMsg, fieldName)
 		if fd != nil && isMessageType(fd.Type) {
@@ -199,22 +238,22 @@ func (g *generator) renderGoMethod(out *strings.Builder, svc *serviceDef, rpc *r
 			inner := g.messageInnerValueType(fd.Type)
 			switch inner {
 			case "int32":
-				out.WriteString(fmt.Sprintf("\t%s := strconv.FormatInt(int64(req.%s().GetValue()), 10)\n", fieldName, getter))
+				out.WriteString(fmt.Sprintf("\t%s := strconv.FormatInt(int64(req.%s().GetValue()), 10)\n", varName, getter))
 			case "int64":
-				out.WriteString(fmt.Sprintf("\t%s := strconv.FormatInt(req.%s().GetValue(), 10)\n", fieldName, getter))
+				out.WriteString(fmt.Sprintf("\t%s := strconv.FormatInt(req.%s().GetValue(), 10)\n", varName, getter))
 			case "float":
-				out.WriteString(fmt.Sprintf("\t%s := strconv.FormatFloat(float64(req.%s().GetValue()), 'f', -1, 32)\n", fieldName, getter))
+				out.WriteString(fmt.Sprintf("\t%s := strconv.FormatFloat(float64(req.%s().GetValue()), 'f', -1, 32)\n", varName, getter))
 			case "double":
-				out.WriteString(fmt.Sprintf("\t%s := strconv.FormatFloat(req.%s().GetValue(), 'f', -1, 64)\n", fieldName, getter))
+				out.WriteString(fmt.Sprintf("\t%s := strconv.FormatFloat(req.%s().GetValue(), 'f', -1, 64)\n", varName, getter))
 			default: // string or unknown
-				out.WriteString(fmt.Sprintf("\t%s := req.%s().GetValue()\n", fieldName, getter))
+				out.WriteString(fmt.Sprintf("\t%s := req.%s().GetValue()\n", varName, getter))
 			}
 		} else if fd != nil && fd.Type == "float" {
-			out.WriteString(fmt.Sprintf("\t%s := strconv.FormatFloat(float64(req.%s()), 'f', -1, 32)\n", fieldName, getter))
+			out.WriteString(fmt.Sprintf("\t%s := strconv.FormatFloat(float64(req.%s()), 'f', -1, 32)\n", varName, getter))
 		} else if fd != nil && fd.Type == "double" {
-			out.WriteString(fmt.Sprintf("\t%s := strconv.FormatFloat(req.%s(), 'f', -1, 64)\n", fieldName, getter))
+			out.WriteString(fmt.Sprintf("\t%s := strconv.FormatFloat(req.%s(), 'f', -1, 64)\n", varName, getter))
 		} else {
-			out.WriteString(fmt.Sprintf("\t%s := req.%s()\n", fieldName, getter))
+			out.WriteString(fmt.Sprintf("\t%s := req.%s()\n", varName, getter))
 		}
 	}
 	pathExpr := buildPathExprFromVars(rpc.HTTP.Path, reqMsg)
@@ -285,7 +324,12 @@ func (g *generator) renderGoMethod(out *strings.Builder, svc *serviceDef, rpc *r
 		if bodyField != nil {
 			isDotted := strings.Contains(bodyField.Type, ".")
 			isLocalMsg := isMessageType(bodyField.Type) && !isDotted && bodyField.MapValue == ""
-			if isLocalMsg && !bodyField.Repeated {
+			if bodyField.Type == "google.protobuf.Struct" && !bodyField.Repeated {
+				// Catch-all JSON-object body: decode into a structpb.Struct so the
+				// response payload is actually returned (not just the status code).
+				out.WriteString("\tresp.Body, err = runtime.UnmarshalStruct(data)\n")
+				out.WriteString("\tif err != nil {\n\t\treturn nil, err\n\t}\n")
+			} else if isLocalMsg && !bodyField.Repeated {
 				// Single local message body: use proto-aware Unmarshal.
 				goBodyType := protoNameToGoName(bodyField.Type)
 				out.WriteString(fmt.Sprintf("\tresp.Body = &pb.%s{}\n", goBodyType))
@@ -296,7 +340,7 @@ func (g *generator) renderGoMethod(out *strings.Builder, svc *serviceDef, rpc *r
 				out.WriteString("\tif err := runtime.UnmarshalInto(data, &resp.Body); err != nil {\n")
 				out.WriteString("\t\treturn nil, err\n\t}\n")
 			}
-			// Dotted types (google.api.HttpBody etc.) are left empty (no unmarshal).
+			// Other dotted types (google.api.HttpBody etc.) are left empty.
 		}
 	}
 
@@ -323,24 +367,25 @@ func buildPathExprFromVars(pathTemplate string, reqMsg *messageDef) string {
 			parts = append(parts, fmt.Sprintf("%q", pathTemplate[prev:start]))
 		}
 		fieldName := pathTemplate[start+1 : end-1]
+		varName := goLocalName(fieldName)
 		fd := findField(reqMsg, fieldName)
 		if fd != nil && !isMessageType(fd.Type) && fd.Type != "string" &&
 			fd.Type != "float" && fd.Type != "double" {
 			// Primitive non-string, non-float types: variable holds the raw value.
 			switch fd.Type {
 			case "int32":
-				parts = append(parts, fmt.Sprintf("strconv.FormatInt(int64(%s), 10)", fieldName))
+				parts = append(parts, fmt.Sprintf("strconv.FormatInt(int64(%s), 10)", varName))
 			case "int64":
-				parts = append(parts, fmt.Sprintf("strconv.FormatInt(%s, 10)", fieldName))
+				parts = append(parts, fmt.Sprintf("strconv.FormatInt(%s, 10)", varName))
 			case "bool":
-				parts = append(parts, fmt.Sprintf("strconv.FormatBool(%s)", fieldName))
+				parts = append(parts, fmt.Sprintf("strconv.FormatBool(%s)", varName))
 			default:
-				parts = append(parts, fieldName)
+				parts = append(parts, varName)
 			}
 		} else {
 			// string, float/double (already string in declaration), and message types
 			// (GetValue() already called) all use PathEscape.
-			parts = append(parts, fmt.Sprintf("neturl.PathEscape(%s)", fieldName))
+			parts = append(parts, fmt.Sprintf("runtime.EscapePath(%s)", varName))
 		}
 		prev = end
 	}

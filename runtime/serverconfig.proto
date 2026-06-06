@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+// Package openapi2proto.runtime holds shared types for generated servers.
+package openapi2proto.runtime;
+
+option go_package = "github.com/accretional/openapi2proto/runtime;runtime";
+
+// ServerConfig is the textproto config for a generated gRPC server. It selects
+// which API to serve and where to listen; it deliberately carries no
+// credentials (the bearer token is read from stdin).
+message ServerConfig {
+  // API name to serve, e.g. "iam".
+  string api = 1;
+  // API version to serve, e.g. "v1".
+  string version = 2;
+  // gRPC listen address, e.g. ":50051" (defaults to ":50051" if empty).
+  string address = 3;
+  // Optional override for the upstream REST base URL.
+  string base_url = 4;
+}

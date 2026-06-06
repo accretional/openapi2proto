@@ -10,6 +10,8 @@ import (
 
 	"github.com/getkin/kin-openapi/openapi2"
 	"github.com/getkin/kin-openapi/openapi2conv"
+	"github.com/google/gnostic/conversions"
+	discovery "github.com/google/gnostic/discovery"
 	openapiv3 "github.com/google/gnostic/openapiv3"
 	yaml "go.yaml.in/yaml/v3"
 )
@@ -59,6 +61,16 @@ func DecodeOpenAPIFromBytes(data []byte) (*openapiv3.Document, error) {
 		return nil, err
 	}
 
+	// Google Discovery Document (kind: discovery#restDescription): these are
+	// what the Google APIs discovery service serves at each API's
+	// "discoveryRestUrl" and are not OpenAPI. Convert them to gnostic's
+	// OpenAPI v3 model directly via gnostic's discovery converter. Detected by
+	// the absence of an "openapi"/"swagger" version key together with a
+	// discovery marker.
+	if isDiscoveryDocument(documentRoot(&root)) {
+		return discoveryToOpenAPIv3(&root)
+	}
+
 	// OpenAPI 2.0 (Swagger): up-convert to v3 first.
 	if sw := mapValue(documentRoot(&root), "swagger"); sw != nil &&
 		len(sw.Value) >= 1 && sw.Value[0] == '2' {
@@ -90,6 +102,45 @@ func DecodeOpenAPIFromBytes(data []byte) (*openapiv3.Document, error) {
 		return nil, err
 	}
 	return openapiv3.ParseDocument(normalized)
+}
+
+// isDiscoveryDocument reports whether the parsed document root is a Google API
+// Discovery Document rather than an OpenAPI/Swagger spec. Discovery documents
+// carry no "openapi" or "swagger" version key; they identify themselves with
+// "kind": "discovery#restDescription" and/or a "discoveryVersion" field.
+func isDiscoveryDocument(doc *yaml.Node) bool {
+	if doc == nil {
+		return false
+	}
+	if mapValue(doc, "openapi") != nil || mapValue(doc, "swagger") != nil {
+		return false
+	}
+	if k := mapValue(doc, "kind"); k != nil && k.Value == "discovery#restDescription" {
+		return true
+	}
+	return mapValue(doc, "discoveryVersion") != nil
+}
+
+// discoveryToOpenAPIv3 converts a parsed Google Discovery Document to gnostic's
+// OpenAPI v3 document model using gnostic's built-in discovery converter (the
+// same conversion exposed by gnostic's "disco --openapi3" command). The
+// document is first stripped of keys gnostic's strict discovery model would
+// reject (see sanitizeDiscoveryDocument).
+func discoveryToOpenAPIv3(root *yaml.Node) (*openapiv3.Document, error) {
+	sanitizeDiscoveryDocument(documentRoot(root))
+	normalized, err := yaml.Marshal(root)
+	if err != nil {
+		return nil, err
+	}
+	doc, err := discovery.ParseDocument(normalized)
+	if err != nil {
+		return nil, fmt.Errorf("parsing discovery document: %w", err)
+	}
+	v3, err := conversions.OpenAPIv3(doc)
+	if err != nil {
+		return nil, fmt.Errorf("converting discovery document to OpenAPI v3: %w", err)
+	}
+	return v3, nil
 }
 
 // convertSwaggerV2ToV3 converts an OpenAPI 2.0 document (as a yaml.Node) to an

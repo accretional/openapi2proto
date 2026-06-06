@@ -39,18 +39,36 @@ func GenerateServerMain(goModule string, entries []ServerEntry) []byte {
 	b.WriteString("package main\n\n")
 
 	b.WriteString("import (\n")
+	b.WriteString("\t\"context\"\n")
 	b.WriteString("\t\"flag\"\n")
 	b.WriteString("\t\"fmt\"\n")
 	b.WriteString("\t\"log\"\n")
 	b.WriteString("\t\"net\"\n")
 	b.WriteString("\t\"os\"\n")
-	b.WriteString("\t\"sort\"\n\n")
-	b.WriteString("\t\"google.golang.org/grpc\"\n\n")
+	b.WriteString("\t\"sort\"\n")
+	b.WriteString("\t\"strings\"\n\n")
+	b.WriteString("\t\"google.golang.org/grpc\"\n")
+	b.WriteString("\t\"google.golang.org/grpc/metadata\"\n\n")
 	b.WriteString("\t\"github.com/accretional/openapi2proto/runtime\"\n")
 	for _, e := range sorted {
 		b.WriteString(fmt.Sprintf("\t%s %q\n", e.Alias, e.Import))
 	}
 	b.WriteString(")\n\n")
+
+	// Auth interceptor: forward a caller-supplied bearer token (gRPC
+	// "authorization" metadata) to the upstream API, overriding the server's
+	// own token for that request.
+	b.WriteString("// tokenInterceptor forwards a caller's \"authorization\" metadata token to the\n")
+	b.WriteString("// upstream REST call, so clients may supply their own (more privileged) token\n")
+	b.WriteString("// while the server falls back to its configured service-account token.\n")
+	b.WriteString("func tokenInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {\n")
+	b.WriteString("\tif md, ok := metadata.FromIncomingContext(ctx); ok {\n")
+	b.WriteString("\t\tif vals := md.Get(\"authorization\"); len(vals) > 0 && vals[0] != \"\" {\n")
+	b.WriteString("\t\t\tctx = runtime.WithToken(ctx, strings.TrimPrefix(vals[0], \"Bearer \"))\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\treturn handler(ctx, req)\n")
+	b.WriteString("}\n\n")
 
 	// Registry entry type + table.
 	b.WriteString("type apiEntry struct {\n")
@@ -105,7 +123,7 @@ func GenerateServerMain(goModule string, entries []ServerEntry) []byte {
 	b.WriteString("\t}\n\n")
 
 	b.WriteString("\tclient := runtime.New(base, token)\n")
-	b.WriteString("\tsrv := grpc.NewServer()\n")
+	b.WriteString("\tsrv := grpc.NewServer(grpc.UnaryInterceptor(tokenInterceptor))\n")
 	b.WriteString("\tentry.register(srv, client)\n\n")
 
 	b.WriteString("\tlis, err := net.Listen(\"tcp\", *addr)\n")
@@ -149,11 +167,13 @@ func GenerateClientMain(goModule string, entries []ServerEntry) []byte {
 	b.WriteString("\t\"flag\"\n")
 	b.WriteString("\t\"fmt\"\n")
 	b.WriteString("\t\"log\"\n")
+	b.WriteString("\t\"os\"\n")
 	b.WriteString("\t\"sort\"\n")
 	b.WriteString("\t\"strings\"\n")
 	b.WriteString("\t\"time\"\n\n")
 	b.WriteString("\t\"google.golang.org/grpc\"\n")
 	b.WriteString("\t\"google.golang.org/grpc/credentials/insecure\"\n")
+	b.WriteString("\t\"google.golang.org/grpc/metadata\"\n")
 	b.WriteString("\t\"google.golang.org/protobuf/encoding/protojson\"\n")
 	b.WriteString("\t\"google.golang.org/protobuf/reflect/protoreflect\"\n")
 	b.WriteString("\t\"google.golang.org/protobuf/reflect/protoregistry\"\n")
@@ -222,6 +242,7 @@ func GenerateClientMain(goModule string, entries []ServerEntry) []byte {
 	b.WriteString("\tlist := flag.Bool(\"list\", false, \"list available method paths and exit\")\n")
 	b.WriteString("\tfilter := flag.String(\"filter\", \"\", \"substring filter for -list\")\n")
 	b.WriteString("\ttimeout := flag.Duration(\"timeout\", 30*time.Second, \"request timeout\")\n")
+	b.WriteString("\ttoken := flag.String(\"token\", \"\", \"bearer token sent to the server (falls back to $GOOGLE_API_TOKEN)\")\n")
 	b.WriteString("\tflag.Parse()\n\n")
 
 	b.WriteString("\tif *list {\n")
@@ -250,6 +271,15 @@ func GenerateClientMain(goModule string, entries []ServerEntry) []byte {
 
 	b.WriteString("\tctx, cancel := context.WithTimeout(context.Background(), *timeout)\n")
 	b.WriteString("\tdefer cancel()\n")
+	b.WriteString("\t// Send the caller's token to the server as \"authorization\" metadata; the\n")
+	b.WriteString("\t// server forwards it to the upstream API, overriding its own token.\n")
+	b.WriteString("\ttok := *token\n")
+	b.WriteString("\tif tok == \"\" {\n")
+	b.WriteString("\t\ttok = os.Getenv(\"GOOGLE_API_TOKEN\")\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\tif tok != \"\" {\n")
+	b.WriteString("\t\tctx = metadata.AppendToOutgoingContext(ctx, \"authorization\", \"Bearer \"+tok)\n")
+	b.WriteString("\t}\n")
 	b.WriteString("\t// grpc.Invoke wants a leading-slash full method path.\n")
 	b.WriteString("\tfullMethod := *method\n")
 	b.WriteString("\tif !strings.HasPrefix(fullMethod, \"/\") {\n")

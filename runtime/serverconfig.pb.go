@@ -23,19 +23,13 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// ServerConfig is the textproto config for a generated gRPC server. It selects
-// which API to serve and where to listen; it deliberately carries no
-// credentials (the bearer token is read from stdin).
+// ServerConfig is the textproto config for a generated gRPC server. The server
+// serves every API in its registry; this config only sets where it listens. It
+// deliberately carries no credentials (the bearer token is read from stdin).
 type ServerConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// API name to serve, e.g. "iam".
-	Api string `protobuf:"bytes,1,opt,name=api,proto3" json:"api,omitempty"`
-	// API version to serve, e.g. "v1".
-	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
 	// gRPC listen address, e.g. ":50051" (defaults to ":50051" if empty).
-	Address string `protobuf:"bytes,3,opt,name=address,proto3" json:"address,omitempty"`
-	// Optional override for the upstream REST base URL.
-	BaseUrl       string `protobuf:"bytes,4,opt,name=base_url,json=baseUrl,proto3" json:"base_url,omitempty"`
+	Address       string `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -70,30 +64,9 @@ func (*ServerConfig) Descriptor() ([]byte, []int) {
 	return file_runtime_serverconfig_proto_rawDescGZIP(), []int{0}
 }
 
-func (x *ServerConfig) GetApi() string {
-	if x != nil {
-		return x.Api
-	}
-	return ""
-}
-
-func (x *ServerConfig) GetVersion() string {
-	if x != nil {
-		return x.Version
-	}
-	return ""
-}
-
 func (x *ServerConfig) GetAddress() string {
 	if x != nil {
 		return x.Address
-	}
-	return ""
-}
-
-func (x *ServerConfig) GetBaseUrl() string {
-	if x != nil {
-		return x.BaseUrl
 	}
 	return ""
 }
@@ -102,12 +75,9 @@ var File_runtime_serverconfig_proto protoreflect.FileDescriptor
 
 const file_runtime_serverconfig_proto_rawDesc = "" +
 	"\n" +
-	"\x1aruntime/serverconfig.proto\x12\x15openapi2proto.runtime\"o\n" +
-	"\fServerConfig\x12\x10\n" +
-	"\x03api\x18\x01 \x01(\tR\x03api\x12\x18\n" +
-	"\aversion\x18\x02 \x01(\tR\aversion\x12\x18\n" +
-	"\aaddress\x18\x03 \x01(\tR\aaddress\x12\x19\n" +
-	"\bbase_url\x18\x04 \x01(\tR\abaseUrlB6Z4github.com/accretional/openapi2proto/runtime;runtimeb\x06proto3"
+	"\x1aruntime/serverconfig.proto\x12\x15openapi2proto.runtime\"(\n" +
+	"\fServerConfig\x12\x18\n" +
+	"\aaddress\x18\x01 \x01(\tR\aaddressB6Z4github.com/accretional/openapi2proto/runtime;runtimeb\x06proto3"
 
 var (
 	file_runtime_serverconfig_proto_rawDescOnce sync.Once

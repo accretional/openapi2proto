@@ -28,6 +28,23 @@ type Client struct {
 	http    *http.Client
 }
 
+// EscapePath percent-escapes a path-parameter value while preserving "/"
+// separators. Google (and other) REST APIs frequently put resource names like
+// "projects/my-proj/serviceAccounts/x" into a single path position via reserved
+// expansion ({+name} in discovery), where the embedded slashes are literal path
+// separators and must NOT be encoded to %2F. Each slash-delimited segment is
+// escaped individually with url.PathEscape.
+func EscapePath(s string) string {
+	if !strings.Contains(s, "/") {
+		return url.PathEscape(s)
+	}
+	parts := strings.Split(s, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return strings.Join(parts, "/")
+}
+
 // New returns a Client that authenticates with the given bearer token against baseURL.
 func New(baseURL, token string) *Client {
 	return &Client{

@@ -111,7 +111,7 @@ func (g *generator) renderGoService(goModule, pbSubPath, runtimeImport string) [
 						} else if f.Type != "string" {
 							needsStrconv = true
 						}
-						needsURL = true
+						// Path params escape via runtime.EscapePath, not net/url.
 						continue
 					}
 					// Query params.
@@ -383,7 +383,7 @@ func buildPathExprFromVars(pathTemplate string, reqMsg *messageDef) string {
 		} else {
 			// string, float/double (already string in declaration), and message types
 			// (GetValue() already called) all use PathEscape.
-			parts = append(parts, fmt.Sprintf("neturl.PathEscape(%s)", varName))
+			parts = append(parts, fmt.Sprintf("runtime.EscapePath(%s)", varName))
 		}
 		prev = end
 	}

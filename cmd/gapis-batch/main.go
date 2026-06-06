@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -55,7 +56,10 @@ func main() {
 	workers := flag.Int("workers", 16, "number of concurrent workers")
 	limit := flag.Int("limit", 0, "process at most N apis (0 = all)")
 	cacheDisco := flag.Bool("cache_disco", true, "save fetched discovery docs under <out>/discovery")
+	goModule := flag.String("go_module", "", "Go module path; when set, also emit gRPC service stubs under <out>/service")
 	flag.Parse()
+
+	opts := genOpts{out: *out, cacheDisco: *cacheDisco, goModule: *goModule}
 
 	items, err := loadDirectory()
 	if err != nil {
@@ -87,7 +91,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for it := range jobs {
-				results <- convert(client, it, *out, *cacheDisco)
+				results <- convert(client, it, opts)
 			}
 		}()
 	}
@@ -143,7 +147,33 @@ func loadDirectory() ([]apiItem, error) {
 	return d.Items, nil
 }
 
-func convert(client *http.Client, it apiItem, out string, cacheDisco bool) result {
+// genOpts carries per-run output settings to the workers.
+type genOpts struct {
+	out        string
+	cacheDisco bool
+	goModule   string // when non-empty, also emit gRPC service stubs
+}
+
+// nonIdent matches any character not valid in a Go/proto path or identifier
+// segment. Most Google API names/versions are already clean; a handful carry
+// dots or camelCase (e.g. "content"/"v2.1", "youtubeAnalytics"/"v2").
+var nonIdent = regexp.MustCompile(`[^a-zA-Z0-9_]`)
+
+// pkgPaths derives a single coherent set of paths/identifiers for an API so the
+// proto directory, the protoc output directory, the go_package option, and the
+// service's pb import all agree:
+//
+//	path  = "<name>/<verSan>"      e.g. "youtubeAnalytics/v2", "content/v2_1"
+//	alias = "<name><verSan>"       lowercased, identifier-safe Go package name
+func pkgPaths(name, version string) (path, alias string) {
+	verSan := nonIdent.ReplaceAllString(version, "_")
+	nameSan := nonIdent.ReplaceAllString(name, "_")
+	path = nameSan + "/" + verSan
+	alias = strings.ToLower(nonIdent.ReplaceAllString(name+verSan, ""))
+	return path, alias
+}
+
+func convert(client *http.Client, it apiItem, o genOpts) result {
 	r := result{ID: it.ID, Name: it.Name, Version: it.Version, URL: it.DiscoveryRestURL, Stage: "fetch"}
 
 	req, _ := http.NewRequest("GET", it.DiscoveryRestURL, nil)
@@ -163,8 +193,8 @@ func convert(client *http.Client, it apiItem, out string, cacheDisco bool) resul
 		return r
 	}
 	r.DiscoBytes = len(data)
-	if cacheDisco {
-		dir := filepath.Join(out, "discovery")
+	if o.cacheDisco {
+		dir := filepath.Join(o.out, "discovery")
 		os.MkdirAll(dir, 0o755)
 		os.WriteFile(filepath.Join(dir, it.Name+"."+it.Version+".json"), data, 0o644)
 	}
@@ -177,19 +207,23 @@ func convert(client *http.Client, it apiItem, out string, cacheDisco bool) resul
 	}
 
 	r.Stage = "generate"
+	path, alias := pkgPaths(it.Name, it.Version)
+	pbSubPath := "pb/" + path
+	source := it.Name + "." + it.Version
 	cfg := generator.Config{
-		PackageName:         it.Name + "." + it.Version,
+		PackageName:         source,
+		GoPackage:           path + ";" + alias,
 		ServiceGrouping:     "tag",
 		EmitHTTPAnnotations: true,
 	}
-	proto, err := generator.Generate(it.Name+"."+it.Version, doc, cfg)
+	proto, err := generator.Generate(source, doc, cfg)
 	if err != nil {
 		r.Error = err.Error()
 		return r
 	}
 	r.ProtoBytes = len(proto)
 
-	protoDir := filepath.Join(out, "proto", it.Name, it.Version)
+	protoDir := filepath.Join(o.out, "proto", filepath.FromSlash(path))
 	if err := os.MkdirAll(protoDir, 0o755); err != nil {
 		r.Error = err.Error()
 		return r
@@ -200,6 +234,27 @@ func convert(client *http.Client, it apiItem, out string, cacheDisco bool) resul
 		return r
 	}
 	r.ProtoPath = protoPath
+
+	if o.goModule != "" {
+		svc, err := generator.GenerateGoService(source, doc, cfg, o.goModule, pbSubPath, "")
+		if err != nil {
+			r.Stage = "service"
+			r.Error = err.Error()
+			return r
+		}
+		if len(svc) > 0 {
+			svcDir := filepath.Join(o.out, "service", filepath.FromSlash(path))
+			if err := os.MkdirAll(svcDir, 0o755); err != nil {
+				r.Error = err.Error()
+				return r
+			}
+			if err := os.WriteFile(filepath.Join(svcDir, "server.go"), svc, 0o644); err != nil {
+				r.Error = err.Error()
+				return r
+			}
+		}
+	}
+
 	r.Stage = "done"
 	r.OK = true
 	return r

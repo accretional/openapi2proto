@@ -46,6 +46,22 @@ func EscapePath(s string) string {
 	return strings.Join(parts, "/")
 }
 
+type tokenCtxKey struct{}
+
+// WithToken returns a context carrying a per-request bearer token. When set, it
+// overrides the Client's configured token for any call made with that context.
+// This lets a server forward a caller-supplied token (e.g. from gRPC metadata)
+// to the upstream API while falling back to its own service-account token.
+func WithToken(ctx context.Context, token string) context.Context {
+	return context.WithValue(ctx, tokenCtxKey{}, token)
+}
+
+// tokenFromContext returns the per-request token set by WithToken, if any.
+func tokenFromContext(ctx context.Context) string {
+	t, _ := ctx.Value(tokenCtxKey{}).(string)
+	return t
+}
+
 // New returns a Client that authenticates with the given bearer token against baseURL.
 func New(baseURL, token string) *Client {
 	return &Client{
@@ -73,7 +89,15 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	if err != nil {
 		return nil, 0, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	// A caller-supplied token on the context (e.g. forwarded from gRPC
+	// metadata) takes precedence over the Client's configured token.
+	token := c.token
+	if t := tokenFromContext(ctx); t != "" {
+		token = t
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}

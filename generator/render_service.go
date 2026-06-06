@@ -324,7 +324,12 @@ func (g *generator) renderGoMethod(out *strings.Builder, svc *serviceDef, rpc *r
 		if bodyField != nil {
 			isDotted := strings.Contains(bodyField.Type, ".")
 			isLocalMsg := isMessageType(bodyField.Type) && !isDotted && bodyField.MapValue == ""
-			if isLocalMsg && !bodyField.Repeated {
+			if bodyField.Type == "google.protobuf.Struct" && !bodyField.Repeated {
+				// Catch-all JSON-object body: decode into a structpb.Struct so the
+				// response payload is actually returned (not just the status code).
+				out.WriteString("\tresp.Body, err = runtime.UnmarshalStruct(data)\n")
+				out.WriteString("\tif err != nil {\n\t\treturn nil, err\n\t}\n")
+			} else if isLocalMsg && !bodyField.Repeated {
 				// Single local message body: use proto-aware Unmarshal.
 				goBodyType := protoNameToGoName(bodyField.Type)
 				out.WriteString(fmt.Sprintf("\tresp.Body = &pb.%s{}\n", goBodyType))
@@ -335,7 +340,7 @@ func (g *generator) renderGoMethod(out *strings.Builder, svc *serviceDef, rpc *r
 				out.WriteString("\tif err := runtime.UnmarshalInto(data, &resp.Body); err != nil {\n")
 				out.WriteString("\t\treturn nil, err\n\t}\n")
 			}
-			// Dotted types (google.api.HttpBody etc.) are left empty (no unmarshal).
+			// Other dotted types (google.api.HttpBody etc.) are left empty.
 		}
 	}
 

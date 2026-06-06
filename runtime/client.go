@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
@@ -140,6 +141,21 @@ func Unmarshal(data []byte, msg proto.Message) error {
 	data = normalizeSlashKeys(data)
 	data = coerceStringFields(data, msg.ProtoReflect().Descriptor())
 	return protojson.UnmarshalOptions{DiscardUnknown: true}.Unmarshal(data, msg)
+}
+
+// UnmarshalStruct decodes a JSON API response into a structpb.Struct, suitable
+// for a response "body" field of type google.protobuf.Struct (the catch-all body
+// type the converter emits when an operation has no typed response schema). An
+// empty body yields an empty, non-nil Struct.
+func UnmarshalStruct(data []byte) (*structpb.Struct, error) {
+	s := &structpb.Struct{}
+	if len(data) == 0 {
+		return s, nil
+	}
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(data, s); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // MarshalBody serialises a proto message to JSON for use as a request body.

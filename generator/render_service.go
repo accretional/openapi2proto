@@ -152,6 +152,17 @@ func (g *generator) renderGoService(goModule, pbSubPath, runtimeImport string) [
 		g.renderGoServiceImpl(&out, svc, pkgAlias, needsURL, needsStrconv)
 	}
 
+	// RegisterAll wires every service in this package onto a gRPC server,
+	// giving entrypoints a uniform hook regardless of how many services the
+	// spec produced.
+	out.WriteString("// RegisterAll registers every service in this package on srv using client.\n")
+	out.WriteString("func RegisterAll(srv *grpc.Server, client *runtime.Client) {\n")
+	for _, svcName := range g.serviceOrder {
+		goSvcName := protoNameToGoName(g.services[svcName].Name)
+		out.WriteString(fmt.Sprintf("\tNew%sServer(client).Register(srv)\n", goSvcName))
+	}
+	out.WriteString("}\n")
+
 	return []byte(out.String())
 }
 

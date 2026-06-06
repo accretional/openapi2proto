@@ -49,6 +49,10 @@ type result struct {
 	DiscoBytes int    `json:"disco_bytes,omitempty"`
 	ProtoBytes int    `json:"proto_bytes,omitempty"`
 	ProtoPath  string `json:"proto_path,omitempty"`
+	// Entrypoint wiring (set when -go_module is given).
+	BaseURL string `json:"base_url,omitempty"`
+	Import  string `json:"import,omitempty"`
+	Alias   string `json:"alias,omitempty"`
 }
 
 func main() {
@@ -120,6 +124,30 @@ func main() {
 	report, _ := json.MarshalIndent(all, "", "  ")
 	os.WriteFile(filepath.Join(*out, "report.json"), report, 0o644)
 
+	// Emit the generic gRPC entrypoint that can serve any one converted API.
+	if *goModule != "" {
+		var entries []generator.ServerEntry
+		for _, r := range all {
+			if r.OK && r.Import != "" {
+				entries = append(entries, generator.ServerEntry{
+					API:     r.Name,
+					Version: r.Version,
+					BaseURL: r.BaseURL,
+					Import:  r.Import,
+					Alias:   r.Alias,
+				})
+			}
+		}
+		main := generator.GenerateServerMain(*goModule, entries)
+		dir := filepath.Join(*out, "cmd", "server")
+		os.MkdirAll(dir, 0o755)
+		if err := os.WriteFile(filepath.Join(dir, "main.go"), main, 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, "error writing entrypoint:", err)
+		} else {
+			fmt.Printf("wrote entrypoint cmd/server/main.go (%d apis)\n", len(entries))
+		}
+	}
+
 	summarize(all, *out)
 }
 
@@ -171,6 +199,26 @@ func pkgPaths(name, version string) (path, alias string) {
 	path = nameSan + "/" + verSan
 	alias = strings.ToLower(nonIdent.ReplaceAllString(name+verSan, ""))
 	return path, alias
+}
+
+// discoveryBaseURL extracts the REST base URL (no trailing slash) a runtime
+// client should target, from a Google Discovery Document. Generated operation
+// paths are relative to baseUrl (= rootUrl + servicePath), so that is the
+// correct base; rootUrl+servicePath is used as a fallback.
+func discoveryBaseURL(data []byte) string {
+	var d struct {
+		BaseURL     string `json:"baseUrl"`
+		RootURL     string `json:"rootUrl"`
+		ServicePath string `json:"servicePath"`
+	}
+	if err := json.Unmarshal(data, &d); err != nil {
+		return ""
+	}
+	base := d.BaseURL
+	if base == "" {
+		base = strings.TrimRight(d.RootURL, "/") + "/" + strings.TrimLeft(d.ServicePath, "/")
+	}
+	return strings.TrimRight(base, "/")
 }
 
 func convert(client *http.Client, it apiItem, o genOpts) result {
@@ -252,6 +300,9 @@ func convert(client *http.Client, it apiItem, o genOpts) result {
 				r.Error = err.Error()
 				return r
 			}
+			r.BaseURL = discoveryBaseURL(data)
+			r.Import = o.goModule + "/service/" + path
+			r.Alias = alias
 		}
 	}
 

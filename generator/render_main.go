@@ -50,6 +50,7 @@ func GenerateServerMain(goModule string, entries []ServerEntry) []byte {
 	b.WriteString("\t\"strings\"\n\n")
 	b.WriteString("\t\"google.golang.org/grpc\"\n")
 	b.WriteString("\t\"google.golang.org/grpc/metadata\"\n")
+	b.WriteString("\t\"google.golang.org/grpc/reflection\"\n")
 	b.WriteString("\t\"google.golang.org/protobuf/encoding/prototext\"\n\n")
 	b.WriteString("\t\"github.com/accretional/openapi2proto/runtime\"\n")
 	for _, e := range sorted {
@@ -157,7 +158,8 @@ func GenerateServerMain(goModule string, entries []ServerEntry) []byte {
 
 	b.WriteString("\tclient := runtime.New(base, token)\n")
 	b.WriteString("\tsrv := grpc.NewServer(grpc.UnaryInterceptor(tokenInterceptor))\n")
-	b.WriteString("\tentry.register(srv, client)\n\n")
+	b.WriteString("\tentry.register(srv, client)\n")
+	b.WriteString("\treflection.Register(srv) // expose the served API via gRPC reflection\n\n")
 
 	b.WriteString("\tlis, err := net.Listen(\"tcp\", address)\n")
 	b.WriteString("\tif err != nil {\n")

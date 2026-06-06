@@ -91,9 +91,6 @@ func (g *generator) renderGoService(goModule, pbSubPath, runtimeImport string) [
 			if rpc.HTTP == nil {
 				continue
 			}
-			if pathParamRE.MatchString(rpc.HTTP.Path) {
-				needsURL = true
-			}
 			reqMsg := g.messages[rpc.RequestType]
 			if reqMsg != nil {
 				pathSet := pathParamSet(rpc.HTTP.Path)

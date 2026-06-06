@@ -138,13 +138,22 @@ func main() {
 				})
 			}
 		}
-		main := generator.GenerateServerMain(*goModule, entries)
-		dir := filepath.Join(*out, "cmd", "server")
-		os.MkdirAll(dir, 0o755)
-		if err := os.WriteFile(filepath.Join(dir, "main.go"), main, 0o644); err != nil {
-			fmt.Fprintln(os.Stderr, "error writing entrypoint:", err)
+		srvMain := generator.GenerateServerMain(*goModule, entries)
+		srvDir := filepath.Join(*out, "cmd", "server")
+		os.MkdirAll(srvDir, 0o755)
+		if err := os.WriteFile(filepath.Join(srvDir, "main.go"), srvMain, 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, "error writing server entrypoint:", err)
 		} else {
 			fmt.Printf("wrote entrypoint cmd/server/main.go (%d apis)\n", len(entries))
+		}
+
+		cliMain := generator.GenerateClientMain(*goModule, entries)
+		cliDir := filepath.Join(*out, "cmd", "client")
+		os.MkdirAll(cliDir, 0o755)
+		if err := os.WriteFile(filepath.Join(cliDir, "main.go"), cliMain, 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, "error writing client entrypoint:", err)
+		} else {
+			fmt.Printf("wrote entrypoint cmd/client/main.go (%d apis)\n", len(entries))
 		}
 	}
 

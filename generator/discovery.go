@@ -106,8 +106,8 @@ var discoveryDocumentKeys = stringSet(
 	"discoveryVersion", "documentationLink", "etag", "features",
 	"fullyEncodeReservedExpansion", "icons", "id", "kind", "labels", "methods",
 	"mtlsRootUrl", "name", "ownerDomain", "ownerName", "packagePath",
-	"parameters", "protocol", "resources", "revision", "rootUrl", "servicePath",
-	"title", "version", "version_module",
+	"parameters", "protocol", "resources", "revision", "rootUrl", "schemas",
+	"servicePath", "title", "version", "version_module",
 )
 
 var discoverySchemaKeys = stringSet(

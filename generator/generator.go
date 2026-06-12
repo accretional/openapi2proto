@@ -1,6 +1,7 @@
 package generator
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -74,6 +75,14 @@ type messageDef struct {
 	Name    string
 	Comment string
 	Fields  []*fieldDef
+	Enums   []*enumDef // nested enum types
+
+	// scopeIdents holds the exact identifiers occupying this message's scope:
+	// field names plus, for each nested enum, its type name and (per proto3 C++
+	// scoping) its hoisted value names. A nested enum is only emitted if none of
+	// its names collide here; otherwise the field stays a string.
+	scopeIdents   map[string]bool
+	enumTypeNames map[string]int
 }
 
 type fieldDef struct {
@@ -84,6 +93,18 @@ type fieldDef struct {
 	Repeated bool
 	Number   int
 	Comment  string
+}
+
+type enumDef struct {
+	Name    string
+	Comment string
+	Values  []*enumValueDef
+}
+
+type enumValueDef struct {
+	Name    string
+	Number  int
+	Comment string
 }
 
 type protoType struct {
@@ -980,6 +1001,176 @@ func isFreeformObject(schema *openapiv3.Schema) bool {
 		len(schema.GetOneOf()) == 0
 }
 
+// isEnumSchema reports whether a schema should be emitted as a proto enum: a
+// string-typed schema with an enumerated value set and no object/array/map
+// structure. Google Discovery enums are always strings; integer "enums" (rare)
+// are left as scalar fields.
+func isEnumSchema(schema *openapiv3.Schema) bool {
+	if schema == nil || len(schema.GetEnum()) == 0 {
+		return false
+	}
+	if t := schema.GetType(); t != "" && t != "string" {
+		return false
+	}
+	if schema.GetProperties() != nil && len(schema.GetProperties().GetAdditionalProperties()) > 0 {
+		return false
+	}
+	return !isMapSchema(schema) && schema.GetItems() == nil
+}
+
+// enumValueDescriptions decodes the x-enumDescriptions extension (a JSON array
+// aligned with the schema's enum order) carried over from Discovery, if present.
+func enumValueDescriptions(schema *openapiv3.Schema) []string {
+	for _, ext := range schema.GetSpecificationExtension() {
+		if ext.GetName() != enumDescriptionsExtension {
+			continue
+		}
+		var out []string
+		if err := json.Unmarshal([]byte(ext.GetValue().GetYaml()), &out); err == nil {
+			return out
+		}
+	}
+	return nil
+}
+
+// isValidProtoIdent reports whether s is a valid proto identifier
+// ([A-Za-z][A-Za-z0-9_]*), the requirement for a proto enum value name.
+func isValidProtoIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	c := s[0]
+	if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if !(c == '_' || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+			return false
+		}
+	}
+	return true
+}
+
+// confusableEnumKey normalizes an enum value the way protoc does when rejecting
+// confusable value names within an enum: lowercase and drop underscores, then
+// strip the (similarly normalized) enum type name prefix. Because normalization
+// happens first, it catches values that differ only in case/underscore style —
+// e.g. "DEVICE_LICENSE_TYPE_UNSPECIFIED" and "deviceLicenseTypeUnspecified",
+// or "ENGINE_MYSQL" and "MYSQL" under enum Engine — which protoc rejects.
+func confusableEnumKey(enumType, value string) string {
+	norm := func(s string) string { return strings.ToLower(strings.ReplaceAll(s, "_", "")) }
+	return strings.TrimPrefix(norm(value), norm(toScreamingSnake(enumType)))
+}
+
+// isZeroValueName reports whether an exact Discovery enum value should occupy
+// proto enum number 0 (Google's *_UNSPECIFIED / *_UNKNOWN convention).
+func isZeroValueName(ident string) bool {
+	return ident == "UNSPECIFIED" || ident == "UNKNOWN" ||
+		strings.HasSuffix(ident, "_UNSPECIFIED") || strings.HasSuffix(ident, "_UNKNOWN")
+}
+
+// addNestedEnum tries to add a proto enum (type named after propName, nested in
+// msg) for an inline string-enum schema, using the exact Discovery value
+// strings as the proto value names so the REST binding stays faithful: the
+// runtime marshals bodies with protojson, which emits an enum field by its
+// value name, and Google's REST API expects exactly the Discovery string.
+//
+// It returns the nested enum type name, or ("", false) when the values cannot
+// be represented faithfully — invalid identifiers, values confusable under
+// protoc's rules (e.g. "CODE_39" vs "CODE39"), or names that would collide with
+// another enum already nested in this message (proto3 hoists nested enum values
+// into the message scope). In that case the caller keeps the field as a string,
+// matching the pre-enum behavior.
+func (g *generator) addNestedEnum(msg *messageDef, propName string, schema *openapiv3.Schema) (string, bool) {
+	descs := enumValueDescriptions(schema)
+
+	type candidate struct{ name, comment string }
+	var zero *candidate
+	var rest []candidate
+	exact := make(map[string]bool)
+	for i, any := range schema.GetEnum() {
+		raw := any.GetYaml()
+		if !isValidProtoIdent(raw) {
+			return "", false
+		}
+		if exact[raw] {
+			continue // identical duplicate value; harmless to drop
+		}
+		exact[raw] = true
+		comment := ""
+		if i < len(descs) {
+			comment = descs[i]
+		}
+		if zero == nil && isZeroValueName(raw) {
+			zero = &candidate{raw, comment}
+			continue
+		}
+		rest = append(rest, candidate{raw, comment})
+	}
+	if zero == nil && len(rest) == 0 {
+		return "", false
+	}
+
+	if msg.enumTypeNames == nil {
+		msg.enumTypeNames = make(map[string]int)
+	}
+	typeName := unique(toCamel(propName), msg.enumTypeNames)
+
+	var values []*enumValueDef
+	if zero != nil {
+		values = append(values, &enumValueDef{Name: zero.name, Number: 0, Comment: zero.comment})
+	} else {
+		// proto3 requires value 0. Synthesize one; protojson omits zero-valued
+		// enums from output, so a synthetic default is never sent on the wire.
+		synth := toScreamingSnake(typeName) + "_UNSPECIFIED"
+		if !isValidProtoIdent(synth) || exact[synth] {
+			return "", false
+		}
+		values = append(values, &enumValueDef{Name: synth, Number: 0, Comment: "Default value; not a Discovery enum value."})
+	}
+	for i, c := range rest {
+		values = append(values, &enumValueDef{Name: c.name, Number: i + 1, Comment: c.comment})
+	}
+
+	// protoc rejects two of an enum's values that are confusable after stripping
+	// the enum-name prefix (e.g. "ENGINE_MYSQL" vs "MYSQL").
+	confusable := make(map[string]bool)
+	for _, v := range values {
+		k := confusableEnumKey(typeName, v.Name)
+		if confusable[k] {
+			return "", false
+		}
+		confusable[k] = true
+	}
+
+	// proto3 C++ scoping: the enum type name and its hoisted value names must be
+	// unique against everything already in the message scope (field names and
+	// other nested enums). Any collision -> keep the field as a string.
+	if msg.scopeIdents == nil {
+		msg.scopeIdents = make(map[string]bool)
+	}
+	if msg.scopeIdents[typeName] {
+		return "", false
+	}
+	for _, v := range values {
+		if msg.scopeIdents[v.Name] {
+			return "", false
+		}
+	}
+	msg.scopeIdents[typeName] = true
+	for _, v := range values {
+		msg.scopeIdents[v.Name] = true
+	}
+
+	msg.Enums = append(msg.Enums, &enumDef{
+		Name:    typeName,
+		Comment: firstNonEmpty(schema.GetTitle(), schema.GetDescription()),
+		Values:  values,
+	})
+	return typeName, true
+}
+
 func isMapSchema(schema *openapiv3.Schema) bool {
 	if schema == nil || schema.GetAdditionalProperties() == nil {
 		return false
@@ -1034,9 +1225,32 @@ func (g *generator) fillMessageFromSchema(msg *messageDef, schema *openapiv3.Sch
 	}
 	if len(props) > 0 {
 		used := make(map[string]int)
+		// Seed the message scope with every field name so a nested enum whose
+		// type/value names would collide (proto3 C++ scoping) falls back to string.
+		if msg.scopeIdents == nil {
+			msg.scopeIdents = make(map[string]bool)
+		}
+		for _, prop := range props {
+			msg.scopeIdents[toSnake(prop.GetName())] = true
+		}
+		msg.scopeIdents["additional_properties"] = true
 		fieldNo := 1
 		for _, prop := range props {
 			fieldName := uniqueField(toSnake(prop.GetName()), used)
+			// An inline string enum becomes a typed nested enum when it can be
+			// represented faithfully; otherwise it stays a string (see addNestedEnum).
+			if ps := prop.GetValue().GetSchema(); ps != nil && isEnumSchema(ps) {
+				if enumType, ok := g.addNestedEnum(msg, prop.GetName(), ps); ok {
+					msg.Fields = append(msg.Fields, &fieldDef{
+						Name:    fieldName,
+						Type:    enumType,
+						Number:  fieldNo,
+						Comment: propComment(prop.GetName(), prop.GetValue()),
+					})
+					fieldNo++
+					continue
+				}
+			}
 			pt, err := g.protoTypeForSchema(msg.Name+toCamel(prop.GetName()), prop.GetValue())
 			if err != nil {
 				return err

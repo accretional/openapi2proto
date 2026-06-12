@@ -132,6 +132,83 @@ func TestGenerateTwilioVoiceSpecCompiles(t *testing.T) {
 	}
 }
 
+// enumDiscoveryDoc is a Google Discovery document exercising enum handling:
+// a well-formed enum, an enum with no *_UNSPECIFIED value, an enum with
+// confusable aliases, and an enum whose value collides with its field name.
+const enumDiscoveryDoc = `{
+  "kind": "discovery#restDescription",
+  "discoveryVersion": "v1",
+  "name": "widgets",
+  "version": "v1",
+  "rootUrl": "https://widgets.googleapis.com/",
+  "servicePath": "",
+  "schemas": {
+    "Widget": {
+      "id": "Widget",
+      "type": "object",
+      "properties": {
+        "executionEnvironment": {
+          "type": "string",
+          "enum": ["EXECUTION_ENVIRONMENT_UNSPECIFIED", "EXECUTION_ENVIRONMENT_GEN1", "EXECUTION_ENVIRONMENT_GEN2"],
+          "enumDescriptions": ["unset", "first gen", "second gen"]
+        },
+        "mode": {"type": "string", "enum": ["READ", "WRITE"]},
+        "engine": {"type": "string", "enum": ["ENGINE_MYSQL", "MYSQL"]},
+        "approved": {"type": "string", "enum": ["approved", "unapproved"]}
+      }
+    }
+  },
+  "methods": {
+    "get": {
+      "id": "widgets.get",
+      "path": "v1/widget",
+      "httpMethod": "GET",
+      "response": {"$ref": "Widget"}
+    }
+  }
+}`
+
+func TestGenerateEnums(t *testing.T) {
+	doc, err := DecodeOpenAPIFromBytes([]byte(enumDiscoveryDoc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := Generate("widgets.v1", doc, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(out)
+
+	for _, want := range []string{
+		// Exact Discovery value names (so protojson sends the right wire string),
+		// with the source *_UNSPECIFIED placed at 0 and enumDescriptions as comments.
+		"enum ExecutionEnvironment {",
+		"EXECUTION_ENVIRONMENT_UNSPECIFIED = 0;",
+		"EXECUTION_ENVIRONMENT_GEN1 = 1;",
+		"EXECUTION_ENVIRONMENT_GEN2 = 2;",
+		"// second gen",
+		"ExecutionEnvironment execution_environment = 1;",
+		// No *_UNSPECIFIED in source -> synthesize a zero value.
+		"enum Mode {",
+		"MODE_UNSPECIFIED = 0;",
+		"READ = 1;",
+		"WRITE = 2;",
+		// Confusable aliases (ENGINE_MYSQL / MYSQL) -> field stays string.
+		"string engine = 3;",
+		// Enum value "approved" collides with field name "approved" -> string.
+		"string approved = 4;",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated proto missing %q\n%s", want, text)
+		}
+	}
+	for _, notWant := range []string{"enum Engine", "enum Approved"} {
+		if strings.Contains(text, notWant) {
+			t.Fatalf("generated proto unexpectedly contains %q (should fall back to string)\n%s", notWant, text)
+		}
+	}
+}
+
 func TestDecodeOpenAPIFromBytesNormalizesJSONSurrogates(t *testing.T) {
 	const raw = `{"openapi":"3.0.1","info":{"title":"Emoji","version":"1.0"},"paths":{},"components":{"schemas":{"demo":{"type":"object","properties":{"body":{"type":"string","example":"Hello! \ud83d\udc4d"}}}}}}`
 	if _, err := DecodeOpenAPIFromBytes([]byte(raw)); err != nil {

@@ -7,6 +7,12 @@ import (
 )
 
 func DecodeOpenAPIFromBytes(data []byte) (*openapiv3.Document, error) {
+	// Google API Discovery Documents (kind: discovery#restDescription) are not
+	// OpenAPI; convert them via gnostic's discovery converter (see discovery.go).
+	if looksLikeDiscovery(data) {
+		return discoveryToOpenAPIv3(data)
+	}
+
 	// Pre-process JSON to handle constructs the parser can't handle natively.
 	// Unlike the old normalize31 (which stripped all 3.1 keywords), this only
 	// handles structural patterns the gnostic parsing architecture can't support:

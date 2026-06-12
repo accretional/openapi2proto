@@ -40,9 +40,12 @@ func (g *generator) render() []byte {
 func renderMessage(out *strings.Builder, msg *messageDef) {
 	writeComment(out, msg.Comment, 0)
 	out.WriteString(fmt.Sprintf("message %s {\n", msg.Name))
-	if len(msg.Fields) == 0 {
+	if len(msg.Fields) == 0 && len(msg.Enums) == 0 {
 		out.WriteString("}\n")
 		return
+	}
+	for _, e := range msg.Enums {
+		renderEnum(out, e, 1)
 	}
 	for _, field := range msg.Fields {
 		writeComment(out, field.Comment, 1)
@@ -57,6 +60,17 @@ func renderMessage(out *strings.Builder, msg *messageDef) {
 		out.WriteString(fmt.Sprintf("%s %s = %d;\n", field.Type, field.Name, field.Number))
 	}
 	out.WriteString("}\n")
+}
+
+func renderEnum(out *strings.Builder, e *enumDef, indent int) {
+	pad := strings.Repeat("  ", indent)
+	writeComment(out, e.Comment, indent)
+	out.WriteString(fmt.Sprintf("%senum %s {\n", pad, e.Name))
+	for _, value := range e.Values {
+		writeComment(out, value.Comment, indent+1)
+		out.WriteString(fmt.Sprintf("%s  %s = %d;\n", pad, value.Name, value.Number))
+	}
+	out.WriteString(fmt.Sprintf("%s}\n", pad))
 }
 
 func renderService(out *strings.Builder, svc *serviceDef) {

@@ -66,6 +66,21 @@ func toSnake(input string) string {
 	return result
 }
 
+// toScreamingSnake converts an identifier to UPPER_SNAKE_CASE, the proto
+// convention for enum value names. Used both for enum value identifiers and as
+// the per-enum value-name prefix (proto3 enum values share the enclosing scope,
+// so values are prefixed by their enum type name to stay unique within a file).
+func toScreamingSnake(input string) string {
+	parts := words(input)
+	if len(parts) == 0 {
+		return ""
+	}
+	for i, part := range parts {
+		parts[i] = strings.ToUpper(part)
+	}
+	return strings.Join(parts, "_")
+}
+
 func sanitizePackageName(input string) string {
 	parts := words(input)
 	if len(parts) == 0 {

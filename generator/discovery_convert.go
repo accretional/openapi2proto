@@ -22,6 +22,7 @@
 package generator
 
 import (
+	"encoding/json"
 	"log"
 	"net/url"
 	"strings"
@@ -29,6 +30,12 @@ import (
 	discovery "github.com/google/gnostic/discovery"
 	openapi3 "github.com/accretional/openapi2proto/internal/openapiv3"
 )
+
+// enumDescriptionsExtension is the OpenAPI specification-extension key under
+// which Discovery's parallel enumDescriptions array is preserved (JSON-encoded,
+// aligned with the schema's enum order) so the proto generator can render them
+// as enum value comments.
+const enumDescriptionsExtension = "x-enumDescriptions"
 
 func pathForMethod(path string) string {
 	return "/" + strings.Replace(path, "{+", "{", -1)
@@ -64,6 +71,18 @@ func buildOpenAPI3SchemaOrReferenceForSchema(schema *discovery.Schema) *openapi3
 	if len(schema.Enum) > 0 {
 		for _, e := range schema.Enum {
 			s.Enum = append(s.Enum, &openapi3.Any{Yaml: e})
+		}
+		// Discovery carries human-readable enum value docs in a parallel
+		// enumDescriptions array. OpenAPI v3 has no native field for these, so
+		// preserve them as an x-enumDescriptions extension (a JSON array aligned
+		// with Enum order) for the proto generator to emit as value comments.
+		if len(schema.EnumDescriptions) > 0 {
+			if encoded, err := json.Marshal(schema.EnumDescriptions); err == nil {
+				s.SpecificationExtension = append(s.SpecificationExtension, &openapi3.NamedAny{
+					Name:  enumDescriptionsExtension,
+					Value: &openapi3.Any{Yaml: string(encoded)},
+				})
+			}
 		}
 	}
 	if schema.Items != nil {
@@ -305,8 +324,10 @@ func OpenAPIv3(api *discovery.Document) (*openapi3.Document, error) {
 			addOpenAPI3PathsForMethod(d, pair.Name, pair.Value, hasDataWrapper)
 		}
 	}
-	for _, pair := range api.Resources.AdditionalProperties {
-		addOpenAPI3PathsForResource(d, pair.Value, hasDataWrapper)
+	if api.Resources != nil {
+		for _, pair := range api.Resources.AdditionalProperties {
+			addOpenAPI3PathsForResource(d, pair.Value, hasDataWrapper)
+		}
 	}
 
 	return d, nil

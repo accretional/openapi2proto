@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 
+	yaml "go.yaml.in/yaml/v3"
+
 	openapiv3 "github.com/accretional/openapi2proto/internal/openapiv3"
 )
 
@@ -69,6 +71,11 @@ type httpRule struct {
 	Path         string
 	Body         string
 	ResponseBody string
+	// Headers are static request headers to send on every call to this
+	// operation, sourced from the x-openapi2proto-headers vendor extension.
+	// Used for requirements the OpenAPI parameter model can't express, such
+	// as an undocumented required beta opt-in header.
+	Headers map[string]string
 }
 
 type messageDef struct {
@@ -168,8 +175,8 @@ func Generate(sourceName string, doc *openapiv3.Document, cfg Config) ([]byte, e
 	}
 	cfg = withDefaults(sourceName, cfg)
 	g := &generator{
-		cfg:            cfg,
-		sourceName:     sourceName,
+		cfg:              cfg,
+		sourceName:       sourceName,
 		doc:              doc,
 		refs:             newRefResolver(doc),
 		imports:          make(map[string]bool),
@@ -279,6 +286,11 @@ func (g *generator) generateComponents() error {
 		if schema := schemaRef.GetSchema(); schema != nil && isFreeformObject(schema) {
 			continue
 		}
+		// Likewise for schemas marked as an opaque, possibly-non-object value
+		// (google.protobuf.Value): no wrapper message is needed.
+		if schema := schemaRef.GetSchema(); schema != nil && isAnyValueSchema(schema) {
+			continue
+		}
 		if _, err := g.ensureNamedSchemaMessage(name, schemaRef); err != nil {
 			return err
 		}
@@ -355,6 +367,7 @@ func (g *generator) generateOperation(op operationInfo) error {
 			Path:         rewritePathTemplate(op.Path, pathFields),
 			Body:         bodyField,
 			ResponseBody: responseBodyField,
+			Headers:      operationHeaders(op.Op),
 		}
 		g.imports["google/api/annotations.proto"] = true
 	}
@@ -825,6 +838,10 @@ func (g *generator) protoTypeForSchema(nameHint string, schemaRef *openapiv3.Sch
 						g.imports["google/protobuf/struct.proto"] = true
 						return protoType{Type: "google.protobuf.Struct"}, nil
 					}
+					if isAnyValueSchema(refSchema) {
+						g.imports["google/protobuf/struct.proto"] = true
+						return protoType{Type: "google.protobuf.Value"}, nil
+					}
 					if (refSchema.GetType() == "array" || refSchema.GetItems() != nil) &&
 						!isObjectSchema(refSchema) && !isMapSchema(refSchema) {
 						g.processingSchema[name] = true
@@ -867,6 +884,10 @@ func (g *generator) protoTypeForInlineSchema(nameHint string, schema *openapiv3.
 		g.imports["google/protobuf/struct.proto"] = true
 		return protoType{Type: "google.protobuf.Struct"}, nil
 	}
+	if isAnyValueSchema(schema) {
+		g.imports["google/protobuf/struct.proto"] = true
+		return protoType{Type: "google.protobuf.Value"}, nil
+	}
 	if isObjectSchema(schema) {
 		name := unique(toCamel(nameHint), g.messageNames)
 		msg := &messageDef{Name: name, Comment: firstNonEmpty(schema.GetTitle(), schema.GetDescription())}
@@ -882,6 +903,11 @@ func (g *generator) protoTypeForInlineSchema(nameHint string, schema *openapiv3.
 		if itemSchema := item.GetSchema(); itemSchema != nil && isFreeformObject(itemSchema) {
 			g.imports["google/protobuf/struct.proto"] = true
 			return protoType{Type: "google.protobuf.Struct", Repeated: true}, nil
+		}
+		// Opaque, possibly-non-object array items → repeated google.protobuf.Value
+		if itemSchema := item.GetSchema(); itemSchema != nil && isAnyValueSchema(itemSchema) {
+			g.imports["google/protobuf/struct.proto"] = true
+			return protoType{Type: "google.protobuf.Value", Repeated: true}, nil
 		}
 		itemType, err := g.protoTypeForSchema(nameHint+"Item", item)
 		if err != nil {
@@ -962,6 +988,9 @@ func isPureScalarSchema(schema *openapiv3.Schema) bool {
 	if schema == nil {
 		return false
 	}
+	if isAnyValueSchema(schema) {
+		return false
+	}
 	if schema.GetType() == "object" {
 		return false
 	}
@@ -1001,6 +1030,30 @@ func isFreeformObject(schema *openapiv3.Schema) bool {
 		len(schema.GetOneOf()) == 0
 }
 
+// anyValueMarker is the vendor-extension key normalizeStructuralSchema (in
+// parse.go) stamps onto a genuinely heterogeneous anyOf/oneOf schema it can't
+// resolve to a concrete proto type (e.g. string-or-array). It distinguishes
+// that case from a schema the source document actually declared as a
+// freeform object, so the two can map to different proto types below:
+// google.protobuf.Value (any JSON value) instead of google.protobuf.Struct
+// (JSON object only, which can't represent a scalar or array at the top
+// level and would silently corrupt those branches on marshal).
+const anyValueMarker = "x-openapi2proto-any-value"
+
+// isAnyValueSchema reports whether schema was marked by normalizeStructuralSchema
+// as an opaque, possibly-non-object JSON value.
+func isAnyValueSchema(schema *openapiv3.Schema) bool {
+	if schema == nil {
+		return false
+	}
+	for _, ext := range schema.GetSpecificationExtension() {
+		if ext.GetName() == anyValueMarker {
+			return true
+		}
+	}
+	return false
+}
+
 // isEnumSchema reports whether a schema should be emitted as a proto enum: a
 // string-typed schema with an enumerated value set and no object/array/map
 // structure. Google Discovery enums are always strings; integer "enums" (rare)
@@ -1016,6 +1069,31 @@ func isEnumSchema(schema *openapiv3.Schema) bool {
 		return false
 	}
 	return !isMapSchema(schema) && schema.GetItems() == nil
+}
+
+// operationHeadersExtension is the OpenAPI specification-extension key under
+// which a preprocessing step (e.g. proto-openai's generate.py) can attach
+// static per-operation request headers that aren't captured by the OpenAPI
+// parameter model — for example an undocumented required beta opt-in header.
+// Value is a JSON object of header name to header value.
+const operationHeadersExtension = "x-openapi2proto-headers"
+
+// operationHeaders decodes the x-openapi2proto-headers extension on op, if
+// present. The extension's raw value is stored as YAML text (gnostic's
+// compiler.Marshal re-serialises the parsed node to YAML, not JSON, even
+// when the source document was JSON), so this uses a YAML decoder rather
+// than encoding/json.
+func operationHeaders(op *openapiv3.Operation) map[string]string {
+	for _, ext := range op.GetSpecificationExtension() {
+		if ext.GetName() != operationHeadersExtension {
+			continue
+		}
+		var out map[string]string
+		if err := yaml.Unmarshal([]byte(ext.GetValue().GetYaml()), &out); err == nil {
+			return out
+		}
+	}
+	return nil
 }
 
 // enumValueDescriptions decodes the x-enumDescriptions extension (a JSON array
@@ -1318,6 +1396,11 @@ func (g *generator) fillMessageFromSchema(msg *messageDef, schema *openapiv3.Sch
 	if isFreeformObject(schema) {
 		g.imports["google/protobuf/struct.proto"] = true
 		msg.Fields = append(msg.Fields, &fieldDef{Name: "data", Type: "google.protobuf.Struct", Number: 1, Comment: "Unstructured object."})
+		return nil
+	}
+	if isAnyValueSchema(schema) {
+		g.imports["google/protobuf/struct.proto"] = true
+		msg.Fields = append(msg.Fields, &fieldDef{Name: "value", Type: "google.protobuf.Value", Number: 1, Comment: "Opaque JSON value."})
 		return nil
 	}
 	pt := scalarProtoType(schema.GetType(), schema.GetFormat())

@@ -116,12 +116,72 @@ func normalizeStructuralSchema(m map[string]any) {
 		}
 	}
 
-	// If anyOf/oneOf remain with no type or properties, treat as opaque object.
+	// anyOf / oneOf where every inline branch shares the same scalar type
+	// collapses to that scalar type directly, instead of degrading into an
+	// opaque object below. This is a common OpenAI spec pattern for fields
+	// like "model": anyOf[{type: string}, {type: string, enum: [...]}] — a
+	// plain string with a suggested enum, not a real heterogeneous union.
+	// Branches that are refs, objects, or arrays keep the union genuinely
+	// polymorphic, so they're left for the opaque-object fallback.
+	for _, combo := range []string{"anyOf", "oneOf"} {
+		items, ok := m[combo].([]any)
+		if !ok || len(items) == 0 {
+			continue
+		}
+		if _, hasType := m["type"]; hasType {
+			continue
+		}
+		if _, hasProps := m["properties"]; hasProps {
+			continue
+		}
+		sameType, format := "", ""
+		homogeneous := true
+		for _, item := range items {
+			im, ok := item.(map[string]any)
+			if !ok {
+				homogeneous = false
+				break
+			}
+			if _, hasRef := im["$ref"]; hasRef {
+				homogeneous = false
+				break
+			}
+			t, _ := im["type"].(string)
+			if t == "" || t == "object" || t == "array" {
+				homogeneous = false
+				break
+			}
+			if sameType == "" {
+				sameType = t
+				if f, ok := im["format"].(string); ok {
+					format = f
+				}
+			} else if t != sameType {
+				homogeneous = false
+				break
+			}
+		}
+		if homogeneous {
+			delete(m, combo)
+			m["type"] = sameType
+			if format != "" {
+				m["format"] = format
+			}
+		}
+	}
+
+	// If anyOf/oneOf remain with no type or properties, the union is genuinely
+	// heterogeneous (e.g. string-or-array, or a mix of object shapes) and
+	// can't be represented as a typed proto field. Mark it as an opaque JSON
+	// value rather than forcing type: object — the branches may resolve to a
+	// scalar or array at runtime, not just an object, and google.protobuf.Value
+	// (unlike google.protobuf.Struct, which is object-shaped JSON only) can
+	// actually round-trip any of them. See isAnyValueSchema in generator.go.
 	for _, combo := range []string{"anyOf", "oneOf"} {
 		if _, ok := m[combo]; ok {
 			if _, hasType := m["type"]; !hasType {
 				if _, hasProps := m["properties"]; !hasProps {
-					m["type"] = "object"
+					m[anyValueMarker] = true
 					delete(m, combo)
 				}
 			}

@@ -3,10 +3,31 @@ package generator
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 )
 
 var pathParamRE = regexp.MustCompile(`\{([^}]+)\}`)
+
+// headersLiteral renders a Go map literal for a static request-headers map,
+// with keys sorted for deterministic codegen output.
+func headersLiteral(headers map[string]string) string {
+	keys := make([]string, 0, len(headers))
+	for k := range headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString("map[string]string{")
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%q: %q", k, headers[k])
+	}
+	b.WriteString("}")
+	return b.String()
+}
 
 // reservedLocalNames are identifiers that a path-parameter local variable must
 // not shadow: Go keywords (which would be a syntax error, e.g. a param named
@@ -307,8 +328,13 @@ func (g *generator) renderGoMethod(out *strings.Builder, svc *serviceDef, rpc *r
 	if hasBody {
 		bodyArg = "bodyBytes"
 	}
-	out.WriteString(fmt.Sprintf("\tdata, httpStatus, err := s.client.Do(ctx, %q, %s, %s, %s)\n",
-		rpc.HTTP.Method, pathExpr, qArg, bodyArg))
+	if len(rpc.HTTP.Headers) > 0 {
+		out.WriteString(fmt.Sprintf("\tdata, httpStatus, err := s.client.DoWithHeaders(ctx, %q, %s, %s, %s, %s)\n",
+			rpc.HTTP.Method, pathExpr, qArg, bodyArg, headersLiteral(rpc.HTTP.Headers)))
+	} else {
+		out.WriteString(fmt.Sprintf("\tdata, httpStatus, err := s.client.Do(ctx, %q, %s, %s, %s)\n",
+			rpc.HTTP.Method, pathExpr, qArg, bodyArg))
+	}
 	out.WriteString("\tif err != nil {\n\t\treturn nil, err\n\t}\n")
 
 	// Response.
@@ -416,7 +442,7 @@ func renderQuerySetter(out *strings.Builder, f *fieldDef) {
 			out.WriteString(fmt.Sprintf("\tfor _, v := range req.%s() { q.Add(%q, strconv.FormatFloat(v, 'f', -1, 64)) }\n", getter, key))
 		case "float":
 			out.WriteString(fmt.Sprintf("\tfor _, v := range req.%s() { q.Add(%q, strconv.FormatFloat(float64(v), 'f', -1, 32)) }\n", getter, key))
-		// repeated message / other types — skip
+			// repeated message / other types — skip
 		}
 		return
 	}

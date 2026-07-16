@@ -18,8 +18,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 // Client holds the credentials and transport used for every REST API call.
@@ -75,6 +75,13 @@ func New(baseURL, token string) *Client {
 // transport-level error. path must start with "/" (e.g. "/zones/abc/dns_records").
 // query and body may be nil.
 func (c *Client) Do(ctx context.Context, method, path string, query url.Values, body []byte) ([]byte, int, error) {
+	return c.DoWithHeaders(ctx, method, path, query, body, nil)
+}
+
+// DoWithHeaders behaves like Do but additionally sets the given static headers
+// on the outgoing request. Use for per-operation headers that aren't part of
+// the OpenAPI parameter model, such as a required beta opt-in header.
+func (c *Client) DoWithHeaders(ctx context.Context, method, path string, query url.Values, body []byte, headers map[string]string) ([]byte, int, error) {
 	u := c.baseURL + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
@@ -101,6 +108,9 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -115,14 +125,24 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	return data, resp.StatusCode, nil
 }
 
+// apiError models one error entry. Code is left raw because REST APIs are
+// inconsistent about its type: some use a numeric error code, others a
+// string slug (e.g. "invalid_request_error"), others omit it.
 type apiError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Message string          `json:"message"`
+	Code    json.RawMessage `json:"code"`
 }
 
+// apiEnvelope covers the handful of error-envelope shapes REST APIs
+// commonly use, so StatusError can surface a useful message regardless of
+// which convention a given API follows:
+//   - {"errors": [{"code":.., "message":..}, ...]}
+//   - {"error": {"code":.., "message":..}}
+//   - {"message": ".."}
 type apiEnvelope struct {
-	Success bool       `json:"success"`
 	Errors  []apiError `json:"errors"`
+	Error   *apiError  `json:"error"`
+	Message string     `json:"message"`
 }
 
 // StatusError converts a non-2xx response body and HTTP status into a gRPC status error.
@@ -143,10 +163,35 @@ func StatusError(data []byte, httpStatus int) error {
 	}
 
 	msg := fmt.Sprintf("api: HTTP %d", httpStatus)
-	if len(env.Errors) > 0 {
-		msg = fmt.Sprintf("api: %s (code %d)", env.Errors[0].Message, env.Errors[0].Code)
+	switch {
+	case len(env.Errors) > 0 && env.Errors[0].Message != "":
+		msg = fmt.Sprintf("api: %s%s", env.Errors[0].Message, formatErrorCode(env.Errors[0].Code))
+	case env.Error != nil && env.Error.Message != "":
+		msg = fmt.Sprintf("api: %s%s", env.Error.Message, formatErrorCode(env.Error.Code))
+	case env.Message != "":
+		msg = fmt.Sprintf("api: %s", env.Message)
 	}
 	return status.Error(code, msg)
+}
+
+// formatErrorCode renders an apiError.Code (string, number, or absent/null)
+// as a " (code ...)" suffix, or "" if there's nothing usable to show.
+func formatErrorCode(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		if s == "" {
+			return ""
+		}
+		return fmt.Sprintf(" (code %s)", s)
+	}
+	var n float64
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return fmt.Sprintf(" (code %g)", n)
+	}
+	return ""
 }
 
 // Unmarshal deserialises a JSON API response body into a proto message.
@@ -188,7 +233,184 @@ func MarshalBody(msg proto.Message) ([]byte, error) {
 	if msg == nil {
 		return nil, nil
 	}
-	return protojson.MarshalOptions{UseProtoNames: true}.Marshal(msg)
+	data, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+	return unquoteIntegerFields(data, msg.ProtoReflect().Descriptor()), nil
+}
+
+// isIntegerKind reports whether k is one of protobuf's 64-bit (or fixed-width)
+// integer kinds, the kinds protojson encodes as JSON strings by default to
+// preserve precision for JavaScript consumers.
+func isIntegerKind(k protoreflect.Kind) bool {
+	switch k {
+	case protoreflect.Int64Kind, protoreflect.Uint64Kind,
+		protoreflect.Sint64Kind, protoreflect.Fixed64Kind, protoreflect.Sfixed64Kind:
+		return true
+	default:
+		return false
+	}
+}
+
+// unquoteIntegerFields walks freshly protojson-marshaled request JSON and
+// rewrites 64-bit integer fields from protojson's default quoted-string
+// encoding to bare JSON numbers. protojson quotes them per the proto3 JSON
+// mapping (to avoid precision loss for JavaScript's float64 numbers), but the
+// REST APIs this runtime bridges to overwhelmingly expect a plain JSON
+// integer for an integer request field and reject a quoted one.
+func unquoteIntegerFields(data []byte, md protoreflect.MessageDescriptor) []byte {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return data
+	}
+
+	changed := false
+	for k, v := range raw {
+		if len(v) == 0 {
+			continue
+		}
+
+		fd := md.Fields().ByJSONName(k)
+		if fd == nil {
+			fd = md.Fields().ByName(protoreflect.Name(k))
+		}
+		if fd == nil {
+			continue
+		}
+
+		switch {
+		case fd.IsMap():
+			if isIntegerKind(fd.MapValue().Kind()) {
+				if r, ok := unquoteMapValues(v); ok {
+					raw[k] = r
+					changed = true
+				}
+			}
+
+		case isIntegerKind(fd.Kind()) && fd.IsList() && v[0] == '[':
+			if r, ok := unquoteArrayElements(v); ok {
+				raw[k] = r
+				changed = true
+			}
+
+		case isIntegerKind(fd.Kind()) && !fd.IsList() && v[0] == '"':
+			if s, ok := unquoteJSONString(v); ok {
+				raw[k] = json.RawMessage(s)
+				changed = true
+			}
+
+		case fd.Kind() == protoreflect.MessageKind && !fd.IsList() && v[0] == '{':
+			if r := unquoteIntegerFields(v, fd.Message()); !bytes.Equal(r, v) {
+				raw[k] = r
+				changed = true
+			}
+
+		case fd.Kind() == protoreflect.MessageKind && fd.IsList() && v[0] == '[':
+			var elems []json.RawMessage
+			if err := json.Unmarshal(v, &elems); err != nil {
+				continue
+			}
+			elemChanged := false
+			for i, elem := range elems {
+				if len(elem) > 0 && elem[0] == '{' {
+					if r := unquoteIntegerFields(elem, fd.Message()); !bytes.Equal(r, elem) {
+						elems[i] = r
+						elemChanged = true
+					}
+				}
+			}
+			if elemChanged {
+				if reenc, err := json.Marshal(elems); err == nil {
+					raw[k] = reenc
+					changed = true
+				}
+			}
+		}
+	}
+
+	if !changed {
+		return data
+	}
+	result, err := json.Marshal(raw)
+	if err != nil {
+		return data
+	}
+	return result
+}
+
+// unquoteJSONString extracts the string content of a JSON string literal
+// (e.g. `"123"`) and reports whether it looks like a bare JSON integer, safe
+// to splice back in unquoted.
+func unquoteJSONString(v json.RawMessage) (string, bool) {
+	var s string
+	if err := json.Unmarshal(v, &s); err != nil {
+		return "", false
+	}
+	if s == "" {
+		return "", false
+	}
+	for i, c := range s {
+		if c == '-' && i == 0 {
+			continue
+		}
+		if c < '0' || c > '9' {
+			return "", false
+		}
+	}
+	return s, true
+}
+
+// unquoteArrayElements applies unquoteJSONString to every element of a JSON
+// array of quoted integers.
+func unquoteArrayElements(v json.RawMessage) (json.RawMessage, bool) {
+	var elems []json.RawMessage
+	if err := json.Unmarshal(v, &elems); err != nil {
+		return nil, false
+	}
+	changed := false
+	for i, elem := range elems {
+		if len(elem) > 0 && elem[0] == '"' {
+			if s, ok := unquoteJSONString(elem); ok {
+				elems[i] = json.RawMessage(s)
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return nil, false
+	}
+	reenc, err := json.Marshal(elems)
+	if err != nil {
+		return nil, false
+	}
+	return reenc, true
+}
+
+// unquoteMapValues applies unquoteJSONString to every value of a JSON object
+// representing a map<string, int64-family> field.
+func unquoteMapValues(v json.RawMessage) (json.RawMessage, bool) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(v, &m); err != nil {
+		return nil, false
+	}
+	changed := false
+	for k, elem := range m {
+		if len(elem) > 0 && elem[0] == '"' {
+			if s, ok := unquoteJSONString(elem); ok {
+				m[k] = json.RawMessage(s)
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return nil, false
+	}
+	reenc, err := json.Marshal(m)
+	if err != nil {
+		return nil, false
+	}
+	return reenc, true
 }
 
 // MarshalBodyAny marshals any Go value to JSON for use as a request body.

@@ -273,6 +273,10 @@ func (g *generator) renderGoMethod(out *strings.Builder, svc *serviceDef, rpc *r
 			out.WriteString(fmt.Sprintf("\t%s := strconv.FormatFloat(float64(req.%s()), 'f', -1, 32)\n", varName, getter))
 		} else if fd != nil && fd.Type == "double" {
 			out.WriteString(fmt.Sprintf("\t%s := strconv.FormatFloat(req.%s(), 'f', -1, 64)\n", varName, getter))
+		} else if fd != nil && fd.Type == "bytes" {
+			// Degenerate case (binary-format path param): stringify so the
+			// generated code still compiles and escapes like any string.
+			out.WriteString(fmt.Sprintf("\t%s := string(req.%s())\n", varName, getter))
 		} else {
 			out.WriteString(fmt.Sprintf("\t%s := req.%s()\n", varName, getter))
 		}
@@ -350,7 +354,12 @@ func (g *generator) renderGoMethod(out *strings.Builder, svc *serviceDef, rpc *r
 		if bodyField != nil {
 			isDotted := strings.Contains(bodyField.Type, ".")
 			isLocalMsg := isMessageType(bodyField.Type) && !isDotted && bodyField.MapValue == ""
-			if bodyField.Type == "google.protobuf.Struct" && !bodyField.Repeated {
+			if bodyField.Type == "bytes" && !bodyField.Repeated && bodyField.MapValue == "" {
+				// Raw binary body (OpenAPI type: string, format: binary — e.g.
+				// application/octet-stream): the HTTP response body IS the
+				// payload. No JSON decode; assign the raw bytes directly.
+				out.WriteString("\tresp.Body = data\n")
+			} else if bodyField.Type == "google.protobuf.Struct" && !bodyField.Repeated {
 				// Catch-all JSON-object body: decode into a structpb.Struct so the
 				// response payload is actually returned (not just the status code).
 				out.WriteString("\tresp.Body, err = runtime.UnmarshalStruct(data)\n")
@@ -396,7 +405,7 @@ func buildPathExprFromVars(pathTemplate string, reqMsg *messageDef) string {
 		varName := goLocalName(fieldName)
 		fd := findField(reqMsg, fieldName)
 		if fd != nil && !isMessageType(fd.Type) && fd.Type != "string" &&
-			fd.Type != "float" && fd.Type != "double" {
+			fd.Type != "float" && fd.Type != "double" && fd.Type != "bytes" {
 			// Primitive non-string, non-float types: variable holds the raw value.
 			switch fd.Type {
 			case "int32":

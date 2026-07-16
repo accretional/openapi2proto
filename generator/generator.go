@@ -954,6 +954,16 @@ func scalarProtoType(typ, format string) protoType {
 		}
 		return protoType{Type: "double"}
 	case "string", "":
+		// OpenAPI "format: binary" means the value IS raw binary content
+		// (file uploads/downloads). proto3 string contractually requires
+		// valid UTF-8, so raw bytes can never transit it — map to bytes
+		// (same wire type; protojson encodes bytes as base64 in JSON
+		// bodies, matching OpenAPI's JSON convention for binary).
+		// "format: byte" (base64-encoded TEXT per the spec) stays string:
+		// base64 text is valid UTF-8 and passes through unaltered.
+		if format == "binary" {
+			return protoType{Type: "bytes"}
+		}
 		return protoType{Type: "string"}
 	default:
 		return protoType{Type: "string"}

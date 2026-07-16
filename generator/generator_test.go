@@ -132,6 +132,105 @@ func TestGenerateTwilioVoiceSpecCompiles(t *testing.T) {
 	}
 }
 
+// binarySpec exercises OpenAPI binary handling: a multipart upload with a
+// "format: binary" file property (raw binary content -> proto3 bytes; proto3
+// string requires valid UTF-8, so raw bytes can never transit it), a
+// "format: byte" property (base64-encoded TEXT per the spec -> stays string),
+// and an application/octet-stream response whose body IS the raw payload.
+const binarySpec = `
+openapi: 3.0.1
+info:
+  title: Binary API
+  version: "1.0"
+paths:
+  /v1/files:
+    post:
+      operationId: UploadFile
+      tags: [File]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                checksum:
+                  type: string
+                  format: byte
+                name:
+                  type: string
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+  /v1/files/{FileId}/content:
+    get:
+      operationId: DownloadFile
+      tags: [File]
+      parameters:
+        - name: FileId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: ok
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+`
+
+func TestGenerateBinaryFormat(t *testing.T) {
+	doc, err := DecodeOpenAPIFromBytes([]byte(binarySpec))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := Generate("binary_api.yaml", doc, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		// format: binary -> bytes (raw binary content).
+		"bytes file = ",
+		// format: byte -> string (base64 text is valid UTF-8).
+		"string checksum = ",
+		// plain string untouched.
+		"string name = ",
+		// octet-stream response body -> bytes.
+		"bytes body = ",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated proto missing %q\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "string file = ") {
+		t.Fatalf("format: binary field still generated as string\n%s", text)
+	}
+
+	svc, err := GenerateGoService("binary_api.yaml", doc, Config{}, "example.com/mod", "pb/binaryapi", "github.com/accretional/openapi2proto/runtime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A bytes response body is the raw HTTP payload — assigned directly,
+	// never JSON-decoded.
+	if !strings.Contains(string(svc), "resp.Body = data") {
+		t.Fatalf("generated service missing raw-bytes body assignment\n%s", svc)
+	}
+}
+
 // enumDiscoveryDoc is a Google Discovery document exercising enum handling:
 // a well-formed enum, an enum with no *_UNSPECIFIED value, an enum with
 // confusable aliases, and an enum whose value collides with its field name.

@@ -53,6 +53,26 @@ func normalizeStructuralSchema(m map[string]any) {
 	delete(m, "min_items")
 	delete(m, "max_items")
 
+	// patternProperties (JSON Schema keyword, not in the OpenAPI 3.0 model):
+	// proto has no notion of key-pattern-constrained fields, so fold the
+	// pattern schemas into additionalProperties — the object degrades to a
+	// map. An explicit additionalProperties schema wins; additionalProperties
+	// absent or false takes the single pattern schema (or true when several
+	// patterns disagree).
+	if pp, ok := m["patternProperties"].(map[string]any); ok {
+		delete(m, "patternProperties")
+		ap, hasAP := m["additionalProperties"]
+		if !hasAP || ap == false {
+			if len(pp) == 1 {
+				for _, sub := range pp {
+					m["additionalProperties"] = sub
+				}
+			} else {
+				m["additionalProperties"] = true
+			}
+		}
+	}
+
 	// type as array (e.g. ["string", "null"]) → pick first non-null type.
 	// The parser's TypeItem handles string-or-array, but the schema defines
 	// type as a simple string, so array values fail validation.

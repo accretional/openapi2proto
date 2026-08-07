@@ -308,6 +308,17 @@ func TestGenerateEnums(t *testing.T) {
 	}
 }
 
+func TestDecodeOpenAPIFromBytesFoldsPatternProperties(t *testing.T) {
+	// Mirrors the WorkOS audit-log metadata shape: an object constrained only
+	// by patternProperties (with additionalProperties: false), which the
+	// parser's schema model can't represent. Normalization folds the pattern
+	// schema into additionalProperties so the object degrades to a map.
+	const raw = `{"openapi":"3.0.1","info":{"title":"Pattern","version":"1.0"},"paths":{},"components":{"schemas":{"demo":{"type":"object","properties":{"metadata":{"type":"object","additionalProperties":false,"maxProperties":50,"patternProperties":{"^[a-zA-Z0-9_-]{0,40}$":{"anyOf":[{"type":"string","maxLength":500},{"type":"number"},{"type":"boolean"}]}}}}}}}}`
+	if _, err := DecodeOpenAPIFromBytes([]byte(raw)); err != nil {
+		t.Fatalf("DecodeOpenAPIFromBytes should fold patternProperties into additionalProperties: %v", err)
+	}
+}
+
 func TestDecodeOpenAPIFromBytesNormalizesJSONSurrogates(t *testing.T) {
 	const raw = `{"openapi":"3.0.1","info":{"title":"Emoji","version":"1.0"},"paths":{},"components":{"schemas":{"demo":{"type":"object","properties":{"body":{"type":"string","example":"Hello! \ud83d\udc4d"}}}}}}`
 	if _, err := DecodeOpenAPIFromBytes([]byte(raw)); err != nil {

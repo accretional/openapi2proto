@@ -195,9 +195,10 @@ func formatErrorCode(raw json.RawMessage) string {
 }
 
 // Unmarshal deserialises a JSON API response body into a proto message.
-// It strips "errors" and "messages" envelope keys, normalises slash-delimited
-// JSON keys to underscores, coerces freeform JSON objects/arrays into proto
-// string fields, and silently ignores unknown fields.
+// It strips "errors" and "messages" envelope keys, drops null members and
+// duplicate field spellings, normalises slash-delimited JSON keys to
+// underscores, coerces freeform JSON objects/arrays into proto string
+// fields, and silently ignores unknown fields.
 func Unmarshal(data []byte, msg proto.Message) error {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err == nil {
@@ -207,9 +208,86 @@ func Unmarshal(data []byte, msg proto.Message) error {
 			data = cleaned
 		}
 	}
+	data = sanitizeResponseJSON(data)
 	data = normalizeSlashKeys(data)
 	data = coerceStringFields(data, msg.ProtoReflect().Descriptor())
 	return protojson.UnmarshalOptions{DiscardUnknown: true}.Unmarshal(data, msg)
+}
+
+// sanitizeResponseJSON rewrites a REST response body so protojson can accept
+// it. Null object members are dropped — protojson rejects null for scalar
+// fields, and for proto3 absence means the same thing. Members whose names
+// normalise to the same proto field are deduped, preferring the snake_case
+// spelling: some APIs (e.g. WorkOS list envelopes) send both "list_metadata"
+// and "listMetadata", which protojson treats as the same field appearing
+// twice and rejects. Numbers round-trip via json.Number so 64-bit values
+// keep their precision.
+func sanitizeResponseJSON(data []byte) []byte {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return data
+	}
+	cleaned, changed := sanitizeValue(v)
+	if !changed {
+		return data
+	}
+	out, err := json.Marshal(cleaned)
+	if err != nil {
+		return data
+	}
+	return out
+}
+
+func sanitizeValue(v any) (any, bool) {
+	switch node := v.(type) {
+	case map[string]any:
+		changed := false
+		canon := make(map[string]string, len(node)) // canonical form -> kept key
+		for k := range node {
+			c := canonicalJSONKey(k)
+			prior, seen := canon[c]
+			if !seen {
+				canon[c] = k
+				continue
+			}
+			keep, drop := prior, k
+			if strings.Contains(k, "_") && !strings.Contains(prior, "_") {
+				keep, drop = k, prior
+			}
+			canon[c] = keep
+			delete(node, drop)
+			changed = true
+		}
+		for k, val := range node {
+			if val == nil {
+				delete(node, k)
+				changed = true
+				continue
+			}
+			if sub, subChanged := sanitizeValue(val); subChanged {
+				node[k] = sub
+				changed = true
+			}
+		}
+		return node, changed
+	case []any:
+		changed := false
+		for i, item := range node {
+			if sub, subChanged := sanitizeValue(item); subChanged {
+				node[i] = sub
+				changed = true
+			}
+		}
+		return node, changed
+	default:
+		return v, false
+	}
+}
+
+func canonicalJSONKey(k string) string {
+	return strings.ToLower(strings.ReplaceAll(k, "_", ""))
 }
 
 // UnmarshalStruct decodes a JSON API response into a structpb.Struct, suitable

@@ -1032,12 +1032,19 @@ func isFreeformObject(schema *openapiv3.Schema) bool {
 	if schema == nil {
 		return false
 	}
-	return schema.GetType() == "object" &&
-		(schema.GetProperties() == nil || len(schema.GetProperties().GetAdditionalProperties()) == 0) &&
-		schema.GetAdditionalProperties() == nil &&
-		len(schema.GetAllOf()) == 0 &&
-		len(schema.GetAnyOf()) == 0 &&
-		len(schema.GetOneOf()) == 0
+	if schema.GetProperties() != nil && len(schema.GetProperties().GetAdditionalProperties()) > 0 {
+		return false
+	}
+	if len(schema.GetAllOf())+len(schema.GetAnyOf())+len(schema.GetOneOf()) > 0 {
+		return false
+	}
+	ap := schema.GetAdditionalProperties()
+	if schema.GetType() == "object" {
+		return ap == nil || additionalPropertiesIsAny(ap)
+	}
+	// No explicit type: additionalProperties alone implies an object, and an
+	// unconstrained value schema makes it free-form.
+	return schema.GetType() == "" && schema.GetItems() == nil && additionalPropertiesIsAny(ap)
 }
 
 // anyValueMarker is the vendor-extension key normalizeStructuralSchema (in
@@ -1266,7 +1273,48 @@ func isMapSchema(schema *openapiv3.Schema) bool {
 	if schema.GetProperties() != nil && len(schema.GetProperties().GetAdditionalProperties()) > 0 {
 		return false
 	}
-	return schema.GetAdditionalProperties().GetSchemaOrReference() != nil
+	apRef := schema.GetAdditionalProperties().GetSchemaOrReference()
+	if apRef == nil {
+		return false
+	}
+	// additionalProperties: {} — an unconstrained value schema means "any
+	// JSON value", not map<string, string>; the object is free-form and is
+	// handled by isFreeformObject (google.protobuf.Struct) instead.
+	if apRef.GetReference() == nil && isEmptySchema(apRef.GetSchema()) {
+		return false
+	}
+	return true
+}
+
+// isEmptySchema reports whether schema constrains nothing — the OpenAPI
+// idiom `additionalProperties: {}`, meaning "any JSON value".
+func isEmptySchema(schema *openapiv3.Schema) bool {
+	if schema == nil {
+		return true
+	}
+	return schema.GetType() == "" &&
+		schema.GetFormat() == "" &&
+		schema.GetProperties() == nil &&
+		schema.GetAdditionalProperties() == nil &&
+		schema.GetItems() == nil &&
+		len(schema.GetAllOf()) == 0 &&
+		len(schema.GetAnyOf()) == 0 &&
+		len(schema.GetOneOf()) == 0 &&
+		len(schema.GetEnum()) == 0 &&
+		len(schema.GetSpecificationExtension()) == 0
+}
+
+// additionalPropertiesIsAny reports whether an additionalProperties item
+// places no constraint on member values: either the literal `true` or an
+// empty schema (`{}`).
+func additionalPropertiesIsAny(item *openapiv3.AdditionalPropertiesItem) bool {
+	if item == nil {
+		return false
+	}
+	if apRef := item.GetSchemaOrReference(); apRef != nil {
+		return apRef.GetReference() == nil && isEmptySchema(apRef.GetSchema())
+	}
+	return item.GetBoolean()
 }
 
 func firstItem(schema *openapiv3.Schema) *openapiv3.SchemaOrReference {

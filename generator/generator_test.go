@@ -308,6 +308,61 @@ func TestGenerateEnums(t *testing.T) {
 	}
 }
 
+func TestGenerateUnconstrainedAdditionalProperties(t *testing.T) {
+	// additionalProperties with an empty schema ({}) or `true` means "any
+	// JSON value" — the object must become a free-form
+	// google.protobuf.Struct, not map<string, string> (which rejects
+	// non-string member values at unmarshal time, e.g. WorkOS event
+	// payloads carrying booleans and nested objects).
+	const spec = `
+openapi: 3.0.1
+info:
+  title: Payload API
+  version: "1.0"
+paths:
+  /things:
+    get:
+      operationId: ListThings
+      tags: [Thing]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payload:
+                    type: object
+                    additionalProperties: {}
+                  loose:
+                    type: object
+                    additionalProperties: true
+                  typed:
+                    type: object
+                    additionalProperties:
+                      type: string
+`
+	doc, err := DecodeOpenAPIFromBytes([]byte(spec))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := Generate("payload_api.yaml", doc, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"google.protobuf.Struct payload = ",
+		"google.protobuf.Struct loose = ",
+		"map<string, string> typed = ",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated proto missing %q\n%s", want, text)
+		}
+	}
+}
+
 func TestDecodeOpenAPIFromBytesFoldsPatternProperties(t *testing.T) {
 	// Mirrors the WorkOS audit-log metadata shape: an object constrained only
 	// by patternProperties (with additionalProperties: false), which the

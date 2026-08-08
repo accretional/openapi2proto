@@ -59,6 +59,44 @@ func goLocalName(fieldName string) string {
 	return fieldName
 }
 
+// goFieldGetter derives the Go accessor for a proto field name using
+// protoc-gen-go's GoCamelCase algorithm. Unlike toCamel, it preserves an
+// underscore that precedes a digit — "query_start_time_2" becomes
+// "QueryStartTime_2", matching the accessor protoc-gen-go actually emits
+// (Twilio's StartTime< / StartTime> parameter pairs produce such fields).
+func goFieldGetter(fieldName string) string {
+	return "Get" + goCamelCase(fieldName)
+}
+
+// goCamelCase mirrors protoc-gen-go's GoCamelCase: interior underscores
+// followed by a lowercase letter are dropped with the letter capitalized;
+// underscores followed by anything else (e.g. a digit) are preserved; a
+// lowercase letter following a digit is capitalized.
+func goCamelCase(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '_' && i == 0:
+			b.WriteByte('X') // ensure we start with a capital letter
+		case c == '_' && i+1 < len(s) && s[i+1] >= 'a' && s[i+1] <= 'z':
+			// Skip over '_' in "_{{lowercase}}".
+		case c >= '0' && c <= '9':
+			b.WriteByte(c)
+		default:
+			if c >= 'a' && c <= 'z' {
+				c -= 'a' - 'A'
+			}
+			b.WriteByte(c)
+			for ; i+1 < len(s) && s[i+1] >= 'a' && s[i+1] <= 'z'; i++ {
+				b.WriteByte(s[i+1])
+			}
+		}
+	}
+	return b.String()
+}
+
 // protoNameToGoName applies protoc-gen-go's rule of capitalizing lowercase
 // letters that immediately follow a digit. E.g. "Pfx2as" → "Pfx2As".
 func protoNameToGoName(name string) string {
@@ -252,7 +290,7 @@ func (g *generator) renderGoMethod(out *strings.Builder, svc *serviceDef, rpc *r
 		}
 		declared[fieldName] = true
 		varName := goLocalName(fieldName)
-		getter := protoNameToGoName("Get" + toCamel(fieldName))
+		getter := goFieldGetter(fieldName)
 		fd := findField(reqMsg, fieldName)
 		if fd != nil && isMessageType(fd.Type) {
 			// Message wrapper: extract inner value and convert to string.
@@ -314,7 +352,7 @@ func (g *generator) renderGoMethod(out *strings.Builder, svc *serviceDef, rpc *r
 			!bodyFd.Repeated &&
 			bodyFd.MapValue == "" &&
 			!strings.Contains(bodyFd.Type, ".")
-		bodyGetter := protoNameToGoName("Get" + toCamel(rpc.HTTP.Body))
+		bodyGetter := goFieldGetter(rpc.HTTP.Body)
 		if useProtoMarshal {
 			out.WriteString(fmt.Sprintf("\tbodyBytes, err := runtime.MarshalBody(req.%s())\n", bodyGetter))
 		} else {
@@ -431,7 +469,7 @@ func buildPathExprFromVars(pathTemplate string, reqMsg *messageDef) string {
 }
 
 func renderQuerySetter(out *strings.Builder, f *fieldDef) {
-	getter := protoNameToGoName("Get" + toCamel(f.Name))
+	getter := goFieldGetter(f.Name)
 	key := f.Name
 	if f.OrigName != "" {
 		key = f.OrigName

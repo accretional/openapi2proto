@@ -380,3 +380,63 @@ func TestDecodeOpenAPIFromBytesNormalizesJSONSurrogates(t *testing.T) {
 		t.Fatalf("DecodeOpenAPIFromBytes should normalize JSON surrogate escapes: %v", err)
 	}
 }
+
+// A property whose name is a proto keyword gets suffixed (message ->
+// message_field). protojson matches a field by its json_name or its proto
+// name and by nothing else, so without the annotation the renamed field is
+// invisible on the wire in both directions — the exact failure that silently
+// dropped every assistant message from OpenAI chat completions.
+const renamedPropsDoc = `
+openapi: 3.0.1
+info:
+  title: Renames
+  version: "1.0"
+paths: {}
+components:
+  schemas:
+    choice:
+      type: object
+      properties:
+        message:
+          type: object
+          properties:
+            content:
+              type: string
+        stream:
+          type: boolean
+        finish_reason:
+          type: string
+        enum:
+          type: string
+          enum: [alpha, beta]
+`
+
+func TestGenerateAnnotatesRenamedProperties(t *testing.T) {
+	doc, err := DecodeOpenAPIFromBytes([]byte(renamedPropsDoc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := Generate("renames.v1", doc, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(out)
+
+	for _, want := range []string{
+		// Keyword renames keep the spec's property name on the wire.
+		`message_field = 1 [json_name = "message"];`,
+		`bool stream_field = 2 [json_name = "stream"];`,
+		// An enum-typed property takes the same path through addNestedEnum.
+		`enum_field = 4 [json_name = "enum"];`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated proto missing %q\n%s", want, text)
+		}
+	}
+	// A property the generator did NOT rename must stay annotation-free: its
+	// proto name already matches the wire, and protoc's default json_name
+	// (finishReason) is what the consumer expects to normalize.
+	if strings.Contains(text, `json_name = "finish_reason"`) {
+		t.Fatalf("unrenamed property should carry no json_name\n%s", text)
+	}
+}

@@ -95,6 +95,7 @@ type messageDef struct {
 type fieldDef struct {
 	Name     string
 	OrigName string // original OpenAPI param name (used as HTTP query key); empty means use Name
+	JSONName string // original OpenAPI property name, when toSnake renamed it; empty means the field carries no json_name
 	Type     string
 	MapValue string
 	Repeated bool
@@ -1373,15 +1374,29 @@ func (g *generator) fillMessageFromSchema(msg *messageDef, schema *openapiv3.Sch
 		fieldNo := 1
 		for _, prop := range props {
 			fieldName := uniqueField(toSnake(prop.GetName()), used)
+			// toSnake suffixes proto keywords (message -> message_field) and
+			// uniqueField disambiguates collisions, so the proto name is not
+			// always the name on the wire. protojson matches a field by its
+			// proto name or its json_name and by nothing else, so a property
+			// reachable by neither silently drops its value in both directions
+			// — that is how every assistant message vanished from OpenAI chat
+			// completions. Annotate only those: a camelCase property whose
+			// snake_case field already derives back to it (execution_environment
+			// -> executionEnvironment) is reachable as it stands.
+			jsonName := ""
+			if origName := prop.GetName(); fieldName != origName && defaultJSONName(fieldName) != origName {
+				jsonName = origName
+			}
 			// An inline string enum becomes a typed nested enum when it can be
 			// represented faithfully; otherwise it stays a string (see addNestedEnum).
 			if ps := prop.GetValue().GetSchema(); ps != nil && isEnumSchema(ps) {
 				if enumType, ok := g.addNestedEnum(msg, prop.GetName(), ps); ok {
 					msg.Fields = append(msg.Fields, &fieldDef{
-						Name:    fieldName,
-						Type:    enumType,
-						Number:  fieldNo,
-						Comment: propComment(prop.GetName(), prop.GetValue()),
+						Name:     fieldName,
+						JSONName: jsonName,
+						Type:     enumType,
+						Number:   fieldNo,
+						Comment:  propComment(prop.GetName(), prop.GetValue()),
 					})
 					fieldNo++
 					continue
@@ -1393,6 +1408,7 @@ func (g *generator) fillMessageFromSchema(msg *messageDef, schema *openapiv3.Sch
 			}
 			msg.Fields = append(msg.Fields, &fieldDef{
 				Name:     fieldName,
+				JSONName: jsonName,
 				Type:     pt.Type,
 				MapValue: pt.MapValue,
 				Repeated: pt.Repeated,

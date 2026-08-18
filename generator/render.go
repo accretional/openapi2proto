@@ -50,14 +50,20 @@ func renderMessage(out *strings.Builder, msg *messageDef) {
 	for _, field := range msg.Fields {
 		writeComment(out, field.Comment, 1)
 		out.WriteString("  ")
+		// A field the generator had to rename carries the property name it had
+		// in the spec, so protojson still recognizes it on the wire.
+		opts := ""
+		if field.JSONName != "" {
+			opts = fmt.Sprintf(" [json_name = %q]", field.JSONName)
+		}
 		if field.MapValue != "" {
-			out.WriteString(fmt.Sprintf("map<string, %s> %s = %d;\n", field.MapValue, field.Name, field.Number))
+			out.WriteString(fmt.Sprintf("map<string, %s> %s = %d%s;\n", field.MapValue, field.Name, field.Number, opts))
 			continue
 		}
 		if field.Repeated {
 			out.WriteString("repeated ")
 		}
-		out.WriteString(fmt.Sprintf("%s %s = %d;\n", field.Type, field.Name, field.Number))
+		out.WriteString(fmt.Sprintf("%s %s = %d%s;\n", field.Type, field.Name, field.Number, opts))
 	}
 	out.WriteString("}\n")
 }

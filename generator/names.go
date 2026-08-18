@@ -66,6 +66,29 @@ func toSnake(input string) string {
 	return result
 }
 
+// defaultJSONName reproduces protoc's own json_name derivation: strip
+// underscores, capitalizing whatever follows one. protojson accepts a field
+// under its proto name OR this derived name, so a property already reachable
+// by one of the two needs no explicit annotation.
+func defaultJSONName(name string) string {
+	var out strings.Builder
+	upperNext := false
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c == '_' {
+			upperNext = true
+			continue
+		}
+		if upperNext {
+			out.WriteString(strings.ToUpper(string(c)))
+			upperNext = false
+			continue
+		}
+		out.WriteByte(c)
+	}
+	return out.String()
+}
+
 // toScreamingSnake converts an identifier to UPPER_SNAKE_CASE, the proto
 // convention for enum value names. Used both for enum value identifiers and as
 // the per-enum value-name prefix (proto3 enum values share the enclosing scope,
